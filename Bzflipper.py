@@ -52,7 +52,7 @@ MIN_AUTO_REFRESH_MINUTES = 1  # floor - avoids hammering Hypixel's API if
 # downloadable asset - a bare tag or commit wouldn't give the user
 # anything to click through to.
 APP_VERSION = "1.0.0"
-GITHUB_REPO = "your-github-username/your-repo-name"
+GITHUB_REPO = "Lexiixell/Bazaarflipper"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 # ---- Price-history / manipulation detection ----------------------------
