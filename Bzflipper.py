@@ -1,146 +1,279 @@
 import colorsys
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 import webbrowser
+import zipfile
 from tkinter import ttk, messagebox, colorchooser
 
 import requests
 
 BAZAAR_URL = "https://api.hypixel.net/v2/skyblock/bazaar"
 ITEMS_URL = "https://api.hypixel.net/resources/skyblock/items"
-BAZAAR_TAX = 0.0125          # 1.25% standard sell-side tax (reducible via
-                              # community upgrades, but 1.25% is the safe
-                              # default to assume for estimates)
-MIN_DAILY_COIN_VOLUME = 2_000_000  # filters out dead/illiquid items, measured
-                                    # in COINS of turnover per day - not raw
-                                    # unit count, since a flat unit threshold
-                                    # unfairly excludes expensive items (a
-                                    # 4m-coin item only needs a handful of
-                                    # sales/day to represent serious money
-                                    # moving, but would never clear a
-                                    # units-based bar sized for cheap items)
-EXTREME_MARGIN_THRESHOLD = 150.0  # margins above this get flagged as
-                                   # "unusually high - verify before trusting"
-                                   # rather than treated as simply "great"
+BAZAAR_TAX = 0.0125          # 1.25% sell-side bazaar tax (default rate)
+MIN_DAILY_COIN_VOLUME = 2_000_000  # min trailing daily $ turnover to count as "alive"
+                                    # (coin-based, not unit-based, so expensive items
+                                    # with low unit counts aren't unfairly excluded)
+EXTREME_MARGIN_THRESHOLD = 150.0  # margins above this get flagged as suspicious
 ALL_CATEGORIES = "All"
 DEFAULT_SLEEP_HOURS = 8
 DEFAULT_SPREAD_N = 12
-FULL_LIST_PAGE_SIZE = 40     # Full List renders this many item boxes at a
-                              # time, with a "Show More" button for the
-                              # rest - building hundreds of boxes at once
-                              # synchronously is what used to freeze the
-                              # window.
+FULL_LIST_PAGE_SIZE = 40     # items rendered per "page" in Full List (avoids
+                              # freezing the window building hundreds at once)
 
-# ---- Auto-refresh --------------------------------------------------------
-# Keeps the bazaar snapshot from going stale while you're not actively
-# clicking Refresh yourself. Off by default would mean the "snapshot age"
-# indicator just keeps climbing until you remember to click - the whole
-# point of an unattended Overnight Plan is that nobody's there to remember.
+# ---- Auto-refresh ---------------------------------------------------------
 DEFAULT_AUTO_REFRESH_ENABLED = True
 DEFAULT_AUTO_REFRESH_MINUTES = 2
-MIN_AUTO_REFRESH_MINUTES = 1  # floor - avoids hammering Hypixel's API if
-                               # someone sets this to 0 or a fraction
+MIN_AUTO_REFRESH_MINUTES = 1  # floor, so it can't be set to hammer the API
 
-# ---- Update checker -------------------------------------------------------
-# Checks GitHub's Releases API for a newer published release than this
-# build. Uses the "latest release" endpoint (not tags/commits) since a
-# GitHub Release is the thing that actually has your .exe attached as a
-# downloadable asset - a bare tag or commit wouldn't give the user
-# anything to click through to.
-#
-APP_VERSION = "1.0.2"  # bump this string with each GitHub release you publish
+# ---- Update checker ---------------------------------------------------------
+# Uses GitHub's "latest release" API (has the downloadable asset attached,
+# unlike a bare tag/commit).
+APP_VERSION = "1.0.0"  # bump with each GitHub release
 GITHUB_REPO = "Lexiixell/Bazaarflipper"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
-# ---- Price-history / manipulation detection ----------------------------
-# Hypixel's bazaar API has no historical-price endpoint - only the current
-# snapshot and 7-day *volume* (buyMovingWeek/sellMovingWeek). To get a
-# 7-day AVERAGE PRICE to sanity-check the current snapshot against, this
-# app builds its own local history: every refresh, it records each item's
-# current raw buy/sell prices with a timestamp, and prunes anything older
-# than PRICE_HISTORY_MAX_AGE_DAYS. An item whose current price has drifted
-# far from its own local rolling average is flagged as a manipulation
-# suspect - a real, gradual market move doesn't look like a price that's
-# suddenly a quarter (or 4x) its own week-long average.
-#
-# This needs to accumulate samples over real elapsed time to mean anything,
-# so on a fresh install (or for a brand-new item with no history yet) the
-# check simply doesn't flag anything until PRICE_HISTORY_MIN_SAMPLES is met
-# - it fails open (no flag) rather than closed (false-flagging everything).
+# ---- Price-history / manipulation detection --------------------------------
+# Hypixel's API has no historical-price endpoint, so this app builds its own
+# local 7-day price history each refresh to sanity-check the current price
+# against. Fails open until enough samples exist (no false-flagging on day 1).
 PRICE_HISTORY_MAX_AGE_DAYS = 7
-PRICE_HISTORY_MIN_SAMPLES = 5        # need at least this many snapshots before
-                                      # trusting the average enough to flag
-                                      # anything off of it
-PRICE_DEVIATION_THRESHOLD_PCT = 25.0 # current price this far off its own 7d
-                                      # local average gets flagged - tune this
-                                      # if it's too trigger-happy on normal
-                                      # volatile items, or too lax to catch
-                                      # real manipulation
+PRICE_HISTORY_MIN_SAMPLES = 5        # min snapshots before trusting the average
+PRICE_DEVIATION_THRESHOLD_PCT = 25.0 # % off own 7d avg to flag as suspect
 
-# ---- Snapshot staleness ---------------------------------------------
-# Hypixel's bazaar endpoint returns its own "lastUpdated" timestamp - the
-# moment THEIR backend captured this order-book snapshot, not the moment
-# you fetched it. On volatile/thinly-traded/manipulated items (Precursor
-# Gear being a well-known repeat offender - expensive, thin book relative
-# to its price, frequently targeted by large orders placed and pulled in
-# quick succession) the real order book can already look completely
-# different by the time you glance in-game, even a few seconds later.
-# There's no calculation that fixes bad/old input data - the only real
-# defense is knowing HOW OLD the snapshot you're trusting is, so this is
-# surfaced directly instead of silently assumed fresh.
-STALE_DATA_WARNING_SECONDS = 90  # snapshot age past this turns the age
-                                  # indicator red as a "double-check before
-                                  # trusting this" signal
+# ---- Snapshot staleness -----------------------------------------------------
+# lastUpdated is Hypixel's own capture time, not our fetch time - surfaced so
+# you know how stale the book might be (esp. on thin/manipulated items).
+STALE_DATA_WARNING_SECONDS = 90
 
-# The bazaar snapshot this app fetches is already seconds old, and on
-# high-volume items other players' buy orders queue up and outbid the
-# top-of-book price shown in that snapshot almost immediately - so pricing
-# your own buy order at the exact raw price (what earlier versions did)
-# routinely under-bids the *real* current top order by the time you place
-# it. This buffer nudges the assumed buy price up so the plan reflects a
-# price you can realistically get filled at, not a price that was already
-# gone by the time the API responded.
-#   - It's percentage-based against the item's own raw price, so it scales
-#     naturally instead of being a flat amount that's way too big for a
-#     400-coin item and way too small for a 400k-coin one.
-#   - There's a flat-coin FLOOR (not a ceiling) for cheap items, since a
-#     percentage of a low price is often a fraction of a coin - not
-#     "worth doing" as a percentage, as opposed to just adding a small
-#     flat nudge instead.
-#   - It scales UP automatically for items whose raw margin is already
-#     unusually wide. A "normal" flip clears maybe 5-20%; a margin deep
-#     into the hundreds of percent is much more likely to mean the order
-#     book is thin/stale/being fought over, i.e. exactly the items where
-#     the snapshot price is most likely to already be gone - so those get
-#     bid up harder rather than trusted at face value, the same way the
-#     Overnight Plan spreads risk across more items instead of trusting
-#     one number.
-#   - There's a ceiling on the *percentage* (not a flat coin ceiling) so
-#     the scaling keeps working for expensive items instead of being
-#     capped down to nothing, while still bounding how far this can go.
-DEFAULT_BUY_BUFFER_PCT = 1.0        # base % you control from the top bar
+# ---- Buy-order buffer -------------------------------------------------------
+# The snapshot is already a few seconds old and other buy orders queue up
+# fast, so bidding the raw top price often misses the real current order.
+# This buffer nudges the buy price up: % of price (scales naturally), with a
+# flat coin floor for cheap items and a % ceiling for expensive ones. It also
+# scales up for unusually wide raw margins, since those are the items most
+# likely to have a thin/stale/contested book.
+DEFAULT_BUY_BUFFER_PCT = 1.0        # base % (set from Settings)
 BUY_BUFFER_MIN_COINS = 5            # flat floor for cheap items
-BUY_BUFFER_MAX_PCT = 20.0           # ceiling on the total (base + margin-scaled) %
-BUY_BUFFER_MARGIN_SCALE_START_PCT = 30.0   # raw margins above this start being
-                                            # treated as "unusually good" and begin
-                                            # ramping the buffer up
-BUY_BUFFER_MARGIN_SCALE_PER_100 = 3.0      # extra buffer %, per 100 percentage
-                                            # points of raw margin above the
-                                            # scale-start line
-DEFAULT_PLAN_MIN_DAILY_VOLUME = MIN_DAILY_COIN_VOLUME * 4  # the Overnight Plan
-    # is unattended, so it applies a stricter volume floor than the general
-    # list (which only needs to clear MIN_DAILY_COIN_VOLUME to show up at
-    # all) - thin-but-technically-alive items are exactly the ones most
-    # likely to stall out or get manipulated while you're asleep.
+BUY_BUFFER_MAX_PCT = 20.0           # ceiling on total buffer %
+BUY_BUFFER_MARGIN_SCALE_START_PCT = 30.0   # raw margin above this starts scaling buffer up
+BUY_BUFFER_MARGIN_SCALE_PER_100 = 3.0      # extra buffer % per 100pts of margin above that
+DEFAULT_PLAN_MIN_DAILY_VOLUME = MIN_DAILY_COIN_VOLUME * 4  # Overnight Plan is
+    # unattended so it uses a stricter volume floor than the general list.
 
-# ---- Persistent app-data folder ---------------------------------------
+# ---- Skyblock calendar -----------------------------------------------------
+# No "current date" API field exists - derived from wall-clock time against a
+# fixed epoch, since SB time runs at a constant rate (20 real min/SB day).
+SKYBLOCK_EPOCH_SECONDS = 1560275700
+SKYBLOCK_DAY_SECONDS = 1200
+SKYBLOCK_DAYS_PER_MONTH = 31
+SKYBLOCK_MONTHS_PER_YEAR = 12
+SKYBLOCK_MONTH_NAMES = [
+    "Early Spring", "Spring", "Late Spring",
+    "Early Summer", "Summer", "Late Summer",
+    "Early Autumn", "Autumn", "Late Autumn",
+    "Early Winter", "Winter", "Late Winter",
+]
+LATE_WINTER_MONTH_INDEX = 11
+JERRY_WORKSHOP_WINDOW_SECONDS = 10 * 3600  # opens for first 10 real hrs of Late Winter
+
+
+def get_skyblock_date(timestamp=None):
+    """Unix timestamp -> (year, month_index, month_name, day) SB calendar coords."""
+    if timestamp is None:
+        timestamp = time.time()
+    elapsed = max(0, timestamp - SKYBLOCK_EPOCH_SECONDS)
+    total_sb_days = int(elapsed // SKYBLOCK_DAY_SECONDS)
+    days_per_year = SKYBLOCK_DAYS_PER_MONTH * SKYBLOCK_MONTHS_PER_YEAR
+    year = total_sb_days // days_per_year + 1
+    day_in_year = total_sb_days % days_per_year
+    month_index = day_in_year // SKYBLOCK_DAYS_PER_MONTH
+    day = day_in_year % SKYBLOCK_DAYS_PER_MONTH + 1
+    return year, month_index, SKYBLOCK_MONTH_NAMES[month_index], day
+
+
+def jerry_workshop_status(now=None):
+    """Whether Jerry's Workshop is open: either the SB-calendar Late Winter
+    opening window, or real-life December (checked against local clock)."""
+    if now is None:
+        now = time.time()
+    year, month_index, month_name, day = get_skyblock_date(now)
+    elapsed = max(0, now - SKYBLOCK_EPOCH_SECONDS)
+    total_sb_days = int(elapsed // SKYBLOCK_DAY_SECONDS)
+    seconds_into_current_day = elapsed - total_sb_days * SKYBLOCK_DAY_SECONDS
+    seconds_into_month = (day - 1) * SKYBLOCK_DAY_SECONDS + seconds_into_current_day
+
+    sb_window_open = (month_index == LATE_WINTER_MONTH_INDEX
+                       and seconds_into_month < JERRY_WORKSHOP_WINDOW_SECONDS)
+    real_december_open = (time.localtime(now).tm_mon == 12)
+
+    reasons = []
+    if sb_window_open:
+        reasons.append(f"SkyBlock Late Winter opening window (Year {year}, day {day}/31)")
+    if real_december_open:
+        reasons.append("real-life December")
+
+    return {
+        "active": sb_window_open or real_december_open,
+        "reasons": reasons,
+        "skyblock_year": year,
+        "skyblock_month": month_name,
+        "skyblock_day": day,
+    }
+
+
+# ---- Mayor / election API + seasonal event windows -------------------------
+# Both the elected mayor's perks and the runner-up minister's single perk can
+# trigger a festival, so both are checked.
+MAYOR_URL = "https://api.hypixel.net/v2/resources/skyblock/election"
+
+FESTIVAL_PERK_EVENTS = {
+    "Fishing Festival": "fishing_festival",        # Marina
+    "Mining Fiesta": "mining_fiesta",               # Cole
+    "Mythological Ritual": "mythological_ritual",   # Diana
+}
+PAUL_DUNGEON_DISCOUNT_PERK = "Marauder"  # 20% off dungeon NPC costs
+PAUL_DUNGEON_DISCOUNT_PCT = 20.0
+
+# In-month windows (start_day, end_day), 1-indexed inclusive. Mythological
+# Ritual has no sub-window - it's active for Diana's whole term.
+FISHING_FESTIVAL_DAYS = (1, 3)                 # first 3 days of every month
+MINING_FIESTA_DAYS = (1, 7)                    # days 1-7 of specific months
+MINING_FIESTA_MONTH_INDICES = {4, 5, 6, 7, 8}  # Summer .. Late Autumn
+
+
+def fetch_mayor_info():
+    """Fetch current mayor + minister perks. Raises on failure - caller
+    should treat this as non-fatal supplementary context."""
+    response = requests.get(MAYOR_URL, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("success"):
+        return {}
+
+    mayor = data.get("mayor") or {}
+    perks = [p.get("name") for p in (mayor.get("perks") or []) if p.get("name")]
+    minister = mayor.get("minister") or {}
+    minister_perk = (minister.get("perk") or {}).get("name")
+
+    return {
+        "name": mayor.get("name"),
+        "perks": perks,
+        "minister_name": minister.get("name"),
+        "minister_perk": minister_perk,
+    }
+
+
+def compute_active_festivals(info, now=None):
+    """Which perk-gated festivals are live right now, given fetch_mayor_info()'s
+    output. "active_now" = actually in its window, not just "this mayor's term
+    makes it possible"."""
+    if not info:
+        return []
+    if now is None:
+        now = time.time()
+    _, month_index, _, day = get_skyblock_date(now)
+
+    candidates = []
+    for name in info.get("perks", []) or []:
+        candidates.append((name, info.get("name")))
+    if info.get("minister_perk"):
+        candidates.append((info["minister_perk"], info.get("minister_name")))
+
+    active = []
+    seen = set()
+    for perk_name, source in candidates:
+        event_key = FESTIVAL_PERK_EVENTS.get(perk_name)
+        if not event_key or perk_name in seen:
+            continue
+        seen.add(perk_name)
+
+        window = None
+        active_now = True
+        if event_key == "fishing_festival":
+            window = FISHING_FESTIVAL_DAYS
+            active_now = window[0] <= day <= window[1]
+        elif event_key == "mining_fiesta":
+            window = MINING_FIESTA_DAYS
+            active_now = (month_index in MINING_FIESTA_MONTH_INDICES
+                           and window[0] <= day <= window[1])
+
+        active.append({
+            "label": perk_name,
+            "event_key": event_key,
+            "source": source,
+            "active_now": active_now,
+            "window": window,
+        })
+    return active
+
+
+def paul_dungeon_discount_active(info):
+    """True if mayor or minister currently holds Paul's Marauder perk."""
+    if not info:
+        return False
+    if PAUL_DUNGEON_DISCOUNT_PERK in (info.get("perks") or []):
+        return True
+    return info.get("minister_perk") == PAUL_DUNGEON_DISCOUNT_PERK
+
+
+# Keyword tagging so relevant items can be badged with the event affecting
+# their supply/demand. Keyword-based (not an exhaustive ID list) so it stays
+# useful as Hypixel adds new event items, at the cost of occasional
+# mismatches - fine for an informational badge.
+EVENT_ITEM_KEYWORDS = {
+    "mining_fiesta": ["REFINED_MINERAL", "GLOSSY_GEMSTONE", "MINERAL", "GEMSTONE",
+                       "MITHRIL_ORE", "TITANIUM_ORE"],
+    "fishing_festival": ["SHARK", "PRISMARINE", "MAGMA_FISH"],
+    "mythological_ritual": ["GRIFFIN", "ANCIENT_CLAW", "MYTHOLOGICAL", "PANDORA",
+                             "DAEDALUS", "MEDUSA", "TITAN", "SIREN", "MINOS"],
+    "jerry_workshop": ["GIFT", "NORTH_STAR", "SNOW", "ICE_", "JERRY", "GINGERBREAD",
+                        "CANDY_CANE", "FROZEN", "WALNUT", "STOCKING"],
+    "spooky_festival": ["CANDY_CORN", "MUTANT_ENDERMAN"],
+    "dungeon_supply": ["ESSENCE_", "RECOMBOBULATOR", "FUMING_POTATO_BOOK", "SHADOW_FURY",
+                        "NECRON", "SCYLLA", "STORM_", "GOLDOR", "MAXOR"],
+}
+
+
+def tag_event_relevance(product_id):
+    """event_keys whose keywords appear in this product id."""
+    return [key for key, keywords in EVENT_ITEM_KEYWORDS.items()
+            if any(kw in product_id for kw in keywords)]
+
+
+# ---- Fill-time / sell-time estimates ---------------------------------------
+def compute_fill_sell_hours(flip, units):
+    """Rough hours to fill `units` on the buy side (sellers matching your buy
+    order) and sell side (buyers matching your sell offer), from trailing 7d
+    volume. None if that side has 0 volume (no basis to estimate from)."""
+    sell_daily = flip.get("sell_moving_week", 0) / 7
+    buy_daily = flip.get("buy_moving_week", 0) / 7
+    fill_hours = (units / sell_daily * 24) if sell_daily > 0 else None
+    sell_hours = (units / buy_daily * 24) if buy_daily > 0 else None
+    return fill_hours, sell_hours
+
+
+def fmt_hours(hours):
+    """Minutes under 1h, hours to 1dp under a day, else days. Em dash if unknown."""
+    if hours is None:
+        return "\u2014"
+    hours = max(0, hours)
+    if hours < 1:
+        return f"{hours * 60:.0f}m"
+    if hours < 24:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
+
+
+# ---- Persistent app-data folder --------------------------------------------
 def get_app_data_dir():
-    """Returns (and creates) a per-user folder to store this app's data.
-    Works the same whether run as a .py script or a frozen PyInstaller .exe."""
+    """Per-user data folder, works the same as .py or frozen .exe."""
     if sys.platform == "win32":
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
     elif sys.platform == "darwin":
@@ -158,6 +291,9 @@ SETTINGS_PATH = os.path.join(APP_DATA_DIR, "settings.json")
 CUSTOM_CATEGORIES_PATH = os.path.join(APP_DATA_DIR, "custom_categories.json")
 PRICE_HISTORY_PATH = os.path.join(APP_DATA_DIR, "price_history.json")
 BLACKLIST_PATH = os.path.join(APP_DATA_DIR, "blacklist.json")
+MAYOR_CACHE_PATH = os.path.join(APP_DATA_DIR, "mayor_cache.json")  # last-known
+    # mayor info, so a failed election fetch falls back to it instead of
+    # blanking out event badges.
 
 
 def load_json(path, default):
@@ -173,10 +309,10 @@ def save_json(path, data):
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, sort_keys=True)
     except OSError:
-        pass  # non-fatal - app still works, just won't persist this run
+        pass  # non-fatal - just won't persist this run
 
 
-# ---- Theme -----------------------------------------------------------
+# ---- Theme ------------------------------------------------------------------
 BG_DARK = "#181920"
 BG_PANEL = "#22232f"
 BG_PANEL_RAISED = "#282a3a"
@@ -191,6 +327,7 @@ ACCENT_SOFT = "#3a2f57"
 ACCENT_GREEN = "#4ade80"
 ACCENT_YELLOW = "#facc15"
 ACCENT_RED = "#f87171"
+ACCENT_BLUE = "#60a5fa"
 TEXT_MAIN = "#eceaf6"
 TEXT_DIM = "#9694ac"
 TEXT_FAINT = "#65637a"
@@ -202,31 +339,22 @@ FONT_SUBHEAD = ("Segoe UI", 10, "bold")
 FONT_PILL = ("Segoe UI", 9, "bold")
 FONT_TITLE = ("Segoe UI", 11, "bold")
 
-# Palette a category chip color is deterministically picked from, so the
-# same category always renders the same color across restarts.
+# Deterministic per-category chip color, stable across restarts.
 CHIP_PALETTE = [
     "#b085f5", "#60a5fa", "#4ade80", "#facc15",
     "#f87171", "#38bdf8", "#f472b6", "#a3e635",
     "#fb923c", "#2dd4bf",
 ]
 
-# Quick-pick swatches shown in the Settings > Appearance color wheel panel,
-# in addition to the OS custom-color picker.
 ACCENT_COLOR_PRESETS = [
     "#b085f5", "#60a5fa", "#4ade80", "#facc15", "#f87171",
     "#38bdf8", "#f472b6", "#fb923c", "#2dd4bf", "#a3e635",
 ]
 
-# ---- User-customizable theme -------------------------------------------
-# Only the accent color is user-facing (picked in Settings, via presets or
-# the OS color wheel/picker) - its hover/dim/soft variants are DERIVED from
-# it in HLS space rather than requiring 4 separate picks, so the whole
-# palette stays visually coherent no matter what color someone chooses.
-# Applied once at startup (see apply_saved_theme below), not live - a true
-# live re-theme would mean tracking and reconfiguring every already-built
-# widget (many bake their color in as a literal at creation time, e.g. the
-# hover-color closures in `hoverable()`), which risks leaving parts of the
-# UI half-updated. Restart-to-apply is simpler and can't do that.
+# ---- User-customizable theme ------------------------------------------------
+# Only the accent color is user-facing; hover/dim/soft variants are derived
+# from it in HLS space. Applied once at startup (not live) - avoids needing to
+# reconfigure every already-built widget.
 def _hex_to_rgb01(hex_color):
     hex_color = hex_color.lstrip("#")
     return tuple(int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
@@ -238,8 +366,7 @@ def _rgb01_to_hex(rgb):
 
 
 def derive_accent_shades(accent_hex):
-    """Given a base accent color, derive the hover/dim/soft variants used
-    throughout the UI by adjusting lightness/saturation in HLS space."""
+    """Derive hover/dim/soft variants of a base accent color via HLS."""
     r, g, b = _hex_to_rgb01(accent_hex)
     h, l, s = colorsys.rgb_to_hls(r, g, b)
     hover = colorsys.hls_to_rgb(h, min(0.88, l + 0.12), s)
@@ -253,9 +380,8 @@ def derive_accent_shades(accent_hex):
 
 
 def apply_saved_theme(settings):
-    """Overrides the default ACCENT palette with a user-chosen color from
-    settings.json, if one was saved. Must run before _setup_style() and
-    _build_widgets() - both read these module-level constants directly."""
+    """Override default ACCENT palette from settings.json. Must run before
+    _setup_style()/_build_widgets()."""
     global ACCENT, ACCENT_HOVER, ACCENT_DIM, ACCENT_SOFT
     saved = settings.get("accent_color")
     if isinstance(saved, str) and len(saved) == 7 and saved.startswith("#"):
@@ -266,8 +392,7 @@ def apply_saved_theme(settings):
         ACCENT_SOFT = shades["soft"]
 
 
-# Fields shown inside an expanded item box, in order. "item"/"category"
-# are shown in the box header instead, not repeated here.
+# Fields shown inside an expanded item box (name/category shown in header).
 DETAIL_FIELDS = [
     ("buy_order_at",  "Buy At"),
     ("buy_buffer",    "  \u21b3 buffer included"),
@@ -277,6 +402,16 @@ DETAIL_FIELDS = [
     ("volume",        "Daily Volume"),
     ("weekly_volume", "Weekly Volume (7d)"),
 ]
+
+# Badge text/color per event_key, shown when the event is CURRENTLY relevant.
+EVENT_BADGE_STYLE = {
+    "mining_fiesta":       ("\u26cf Mining Fiesta", ACCENT_YELLOW),
+    "fishing_festival":    ("\U0001F41F Fishing Festival", ACCENT_BLUE),
+    "mythological_ritual": ("\u2666 Mythological Ritual", ACCENT_GREEN),
+    "jerry_workshop":      ("\u2744 Jerry's Workshop", ACCENT_BLUE),
+    "spooky_festival":     ("\U0001F383 Spooky Festival", ACCENT_YELLOW),
+    "dungeon_supply":      ("\u2694 Paul -20% Chests", ACCENT_RED),
+}
 
 SORT_OPTIONS = [
     ("Profit/hr (Purse)", "profit_hr"),
@@ -298,18 +433,14 @@ def format_category(raw):
 
 
 def chip_color(category_name):
-    """Deterministic color for a category name, so it stays stable."""
+    """Deterministic color for a category name."""
     h = sum(ord(c) for c in category_name)
     return CHIP_PALETTE[h % len(CHIP_PALETTE)]
 
 
-# Hypixel's own /resources/skyblock/items "category" field is built mainly
-# to support the reforge/enchant UI (which items are reforgeable, which are
-# enchanted books) - it does NOT attempt to categorize every bazaar-tradeable
-# material. Essence, runes, and some reforge stones commonly have no category
-# at all in Hypixel's data. This fallback fills in a couple of well-known,
-# unambiguous ID naming conventions. Manual overrides (right-click a row)
-# take priority over both this and Hypixel's own data.
+# Hypixel's category field doesn't cover every bazaar item (essence, runes,
+# some reforge stones). Fallback fills in well-known ID prefixes. Manual
+# overrides take priority over both this and Hypixel's own data.
 ID_PREFIX_FALLBACKS = [
     ("ENCHANTMENT_", "Enchanted Books"),
     ("RUNE_", "Runes"),
@@ -324,8 +455,7 @@ def infer_category_from_id(product_id):
 
 
 def _parse_version(v):
-    """Turns 'v1.4.2' / '1.4.2' into (1, 4, 2) for numeric comparison -
-    plain string comparison would wrongly say '1.10.0' < '1.9.0'."""
+    """'v1.4.2'/'1.4.2' -> (1,4,2) for numeric compare (avoids '1.10' < '1.9')."""
     v = v.strip().lstrip("vV")
     parts = []
     for chunk in v.split("."):
@@ -335,11 +465,11 @@ def _parse_version(v):
 
 
 def check_for_update():
-    """Hits GitHub's 'latest release' API for GITHUB_REPO and compares its
-    tag against APP_VERSION. Returns (update_available, latest_version,
-    release_url). Raises on network/HTTP failure - caller decides whether
-    that's worth surfacing (silent on a background auto-check, shown on a
-    manual 'Check for Updates' click)."""
+    """Compare GitHub's latest release tag against APP_VERSION. Returns
+    (update_available, latest_version, release_url, asset_url) - asset_url is
+    the .zip attached to the release (None if not found; GitHub's own
+    auto-generated source zips are deliberately excluded). Raises on
+    network/HTTP failure."""
     response = requests.get(GITHUB_RELEASES_API, timeout=10,
                              headers={"Accept": "application/vnd.github+json"})
     response.raise_for_status()
@@ -347,11 +477,18 @@ def check_for_update():
     latest_tag = data.get("tag_name", "")
     release_url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
     update_available = _parse_version(latest_tag) > _parse_version(APP_VERSION)
-    return update_available, latest_tag, release_url
+
+    asset_url = None
+    for asset in data.get("assets", []):
+        if asset.get("name", "").lower().endswith(".zip"):
+            asset_url = asset.get("browser_download_url")
+            break
+
+    return update_available, latest_tag, release_url, asset_url
 
 
 def fetch_item_categories():
-    """Fetch item metadata and return {item_id: formatted_category}."""
+    """Fetch item metadata -> {item_id: formatted_category}."""
     response = requests.get(ITEMS_URL, timeout=15)
     response.raise_for_status()
     data = response.json()
@@ -368,11 +505,7 @@ def fetch_item_categories():
 
 
 def fetch_bazaar_data():
-    """Fetch the raw bazaar API response (products + Hypixel's own
-    lastUpdated timestamp for this snapshot). Split out from fetch_flips
-    so the caller can read lastUpdated directly instead of it being
-    silently discarded - see the STALE_DATA_WARNING_SECONDS comment
-    above for why that timestamp matters."""
+    """Raw bazaar API response (products + Hypixel's lastUpdated timestamp)."""
     response = requests.get(BAZAAR_URL, timeout=15)
     response.raise_for_status()
 
@@ -383,8 +516,7 @@ def fetch_bazaar_data():
 
 
 def fetch_flips(category_map, overrides, bazaar_data):
-    """Turn a raw bazaar API response (from fetch_bazaar_data) into every
-    profitable flip (list of dicts)."""
+    """Raw bazaar response -> every profitable flip (list of dicts)."""
     products = bazaar_data.get("products", {})
     flips = []
 
@@ -394,36 +526,19 @@ def fetch_flips(category_map, overrides, bazaar_data):
         buy_price = quick_status.get("buyPrice", 0)     # instant-buy price (top sell offer)
         sell_price = quick_status.get("sellPrice", 0)    # instant-sell price (top buy order)
 
-        # NOTE ON VOLUME FIELDS (this was the source of the wildly-off
-        # profit/hr numbers in earlier versions): Hypixel's own API docs
-        # define quick_status.buyVolume/sellVolume as "the sum of item
-        # amounts in all [open] orders" - that's order-BOOK DEPTH, a
-        # snapshot of what's currently listed, not a trade-flow number.
-        # A thinly-traded or manipulated item can pile up huge book depth
-        # (one big spoofed order) while almost nothing actually changes
-        # hands - which is exactly what produced things like a 3000%+
-        # "flip" that was really just a stale, unfillable order sitting
-        # in the book.
-        #
-        # The real turnover metric is buyMovingWeek/sellMovingWeek - units
-        # actually transacted over the trailing 7 days. That's the field
-        # every serious flipping tool bases hourly profit on, so that's
-        # what we use here.
+        # buyVolume/sellVolume = order-book DEPTH (can be spoofed/stale), not
+        # trade flow. buyMovingWeek/sellMovingWeek = units actually
+        # transacted over 7d - the real liquidity metric, used below.
         buy_moving_week = quick_status.get("buyMovingWeek", 0)
         sell_moving_week = quick_status.get("sellMovingWeek", 0)
         avg_daily_volume = (buy_moving_week + sell_moving_week) / 7
 
-        # Coin-value version of the same turnover - this is what actually
-        # decides whether an item is "dead," not the raw unit count. Using
-        # sell_price (what a unit costs you to acquire) keeps this on the
-        # same basis as cost_per_item below.
-        avg_daily_coin_volume = avg_daily_volume * sell_price
+        avg_daily_coin_volume = avg_daily_volume * sell_price  # coin-value turnover
 
         if sell_price <= 0 or buy_price <= 0 or avg_daily_coin_volume < MIN_DAILY_COIN_VOLUME:
             continue
 
-        # Strategy: acquire via buy order at sell_price, then instantly
-        # liquidate to a sell offer at buy_price, minus tax on the sale.
+        # Strategy: buy order at sell_price, instantly liquidate at buy_price minus tax.
         cost_per_item = sell_price
         post_tax_earnings = buy_price * (1 - BAZAAR_TAX)
         raw_profit = post_tax_earnings - cost_per_item
@@ -432,23 +547,20 @@ def fetch_flips(category_map, overrides, bazaar_data):
 
         margin_percent = (raw_profit / cost_per_item) * 100
 
-        # Bottleneck liquidity: you need turnover on BOTH sides to keep
-        # flipping continuously (your buy order needs sellers filling it,
-        # your sell offer needs buyers filling it), so use the thinner
-        # side's weekly turnover - and spread it across a full week
-        # (168h), not 24h, since that's the actual window this data
-        # covers.
+        # Bottleneck liquidity: need turnover on BOTH sides, so use the
+        # thinner side's weekly volume, spread over a full week (168h).
         bottleneck_weekly_volume = min(buy_moving_week, sell_moving_week)
         hourly_volume = bottleneck_weekly_volume / (7 * 24)
 
-        # Priority: manual override > Hypixel's own category > ID-pattern
-        # guess > "Uncategorized".
+        # Priority: manual override > Hypixel category > ID-pattern guess > Uncategorized.
         category = (
             overrides.get(product_id)
             or category_map.get(product_id)
             or infer_category_from_id(product_id)
             or "Uncategorized"
         )
+
+        event_tags = tag_event_relevance(product_id)
 
         flips.append({
             "id": product_id,
@@ -464,28 +576,25 @@ def fetch_flips(category_map, overrides, bazaar_data):
             "raw_buy_target": sell_price,   # top current buy order
             "raw_sell_target": buy_price,   # top current sell offer
             "extreme_margin": margin_percent >= EXTREME_MARGIN_THRESHOLD,
-            "weekly_volume": round(bottleneck_weekly_volume),  # thinner side, 7d - the
-                                                                # real risk signal, not
-                                                                # the friendlier averaged
-                                                                # "volume" figure above
+            "weekly_volume": round(bottleneck_weekly_volume),  # thinner-side 7d, the real risk signal
             "daily_coin_volume": round(avg_daily_coin_volume),
+            "buy_moving_week": buy_moving_week,     # raw 7d totals, for fill/sell estimates
+            "sell_moving_week": sell_moving_week,
+            "event_tags": event_tags,               # keyword-matched seasonal-event tags
         })
 
     flips.sort(key=lambda x: x["profit"], reverse=True)
-    return flips  # no artificial cap - list is scrollable
+    return flips  # no cap - list is scrollable
 
 
-# ---- Local 7-day price history (manipulation detection) ----------------
+# ---- Local 7-day price history (manipulation detection) --------------------
 def load_price_history():
     return load_json(PRICE_HISTORY_PATH, {})
 
 
 def record_and_prune_price_history(history, flips):
     """Append this fetch's raw prices to each item's local history, drop
-    samples older than PRICE_HISTORY_MAX_AGE_DAYS, save, and return the
-    updated history. This is the only source of "7-day average price" -
-    Hypixel's API doesn't expose historical prices, only current snapshot
-    + 7-day volume, so the average has to be built locally over time."""
+    samples older than PRICE_HISTORY_MAX_AGE_DAYS, save, return updated history."""
     now = time.time()
     cutoff = now - PRICE_HISTORY_MAX_AGE_DAYS * 86400
 
@@ -496,9 +605,7 @@ def record_and_prune_price_history(history, flips):
         samples = [s for s in samples if s[0] >= cutoff]
         history[pid] = samples
 
-    # Also prune history for items that no longer show up as live flips at
-    # all (e.g. dropped below the volume floor), so the file doesn't grow
-    # forever with stale entries.
+    # Also prune items no longer live (e.g. dropped below volume floor).
     live_ids = {f["id"] for f in flips}
     for pid in list(history.keys()):
         if pid not in live_ids:
@@ -513,18 +620,9 @@ def record_and_prune_price_history(history, flips):
 
 
 def apply_price_deviation_flags(flips, history):
-    """Compare each flip's current raw buy/sell prices against its own
-    local 7-day average and flag items that have drifted unusually far
-    from their own history - a strong signal of order-book manipulation
-    or a stale/spoofed quote, distinct from the extreme_margin check
-    (which only looks at the CURRENT snapshot in isolation and has no way
-    to tell "this item is always like this" from "this just moved a lot").
-
-    Fails open: an item with fewer than PRICE_HISTORY_MIN_SAMPLES of local
-    history (brand new to the app, or just started clearing the volume
-    filter) is never flagged - there's not enough data yet to call
-    something abnormal, and false-flagging everything on day one would
-    make the flag meaningless."""
+    """Flag items whose current price has drifted far from their own local
+    7d average - catches manipulation extreme_margin alone can miss. Fails
+    open until PRICE_HISTORY_MIN_SAMPLES samples exist."""
     for f in flips:
         samples = history.get(f["id"], [])
         f["price_manipulation_suspect"] = False
@@ -533,8 +631,8 @@ def apply_price_deviation_flags(flips, history):
         if len(samples) < PRICE_HISTORY_MIN_SAMPLES:
             continue
 
-        avg_buy_target = sum(s[1] for s in samples) / len(samples)   # avg of raw_buy_target (sell_price)
-        avg_sell_target = sum(s[2] for s in samples) / len(samples)  # avg of raw_sell_target (buy_price)
+        avg_buy_target = sum(s[1] for s in samples) / len(samples)
+        avg_sell_target = sum(s[2] for s in samples) / len(samples)
 
         dev_buy = (abs(f["raw_buy_target"] - avg_buy_target) / avg_buy_target * 100
                    if avg_buy_target > 0 else 0)
@@ -549,10 +647,8 @@ def apply_price_deviation_flags(flips, history):
 
 
 def compute_buy_buffer_amount(raw_buy_target, raw_margin_percent, base_pct):
-    """The coin amount added on top of the raw top-buy-order price. See the
-    DEFAULT_BUY_BUFFER_PCT comment above for the reasoning: percentage of
-    price, scaled further for suspiciously wide raw margins, floored (not
-    capped) in coins so cheap items still get a meaningful nudge."""
+    """Coin amount added on top of the raw top-buy-order price (see
+    DEFAULT_BUY_BUFFER_PCT comment above)."""
     margin_over = max(0.0, raw_margin_percent - BUY_BUFFER_MARGIN_SCALE_START_PCT)
     margin_bonus_pct = margin_over / 100.0 * BUY_BUFFER_MARGIN_SCALE_PER_100
     effective_pct = min(BUY_BUFFER_MAX_PCT, base_pct + margin_bonus_pct)
@@ -561,11 +657,8 @@ def compute_buy_buffer_amount(raw_buy_target, raw_margin_percent, base_pct):
 
 
 def apply_buy_buffer(flips, buffer_pct):
-    """Recompute buy_order_at/profit/margin using raw_buy_target + a buffer
-    that scales with both the base % you set and the item's own raw
-    margin (see compute_buy_buffer_amount). Returns a new list - items no
-    longer profitable once the buffer is added are dropped, same as the
-    dead/unprofitable filter in fetch_flips, just re-applied post-buffer."""
+    """Recompute buy_order_at/profit/margin with the buffer added. Drops
+    items no longer profitable after buffering."""
     buffer_pct = max(0.0, buffer_pct)
     adjusted = []
     for f in flips:
@@ -597,9 +690,8 @@ def apply_buy_buffer(flips, buffer_pct):
 
 def compute_purse_metrics(flips, purse):
     """Attach purse-limited achievable units & hourly profit to each flip.
-    This is the "if you went all-in on this ONE item" figure - useful for
-    comparing items in the Full List, but NOT what the Overnight Plan
-    actually allocates (see compute_portfolio for that)."""
+    "If you went all-in on this ONE item" figure for the Full List - NOT
+    what the Overnight Plan allocates (see compute_portfolio)."""
     for f in flips:
         max_affordable = int(purse // f["cost_per_item"]) if f["cost_per_item"] > 0 else 0
         achievable_units = max(0, min(max_affordable, int(f["hourly_volume"])))
@@ -609,39 +701,17 @@ def compute_purse_metrics(flips, purse):
 
 
 def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume):
-    """Spread `purse` across up to `target_n` of the best flips, sized so
-    each item's slice is realistically fillable within `sleep_hours` -
-    instead of one all-in pick.
+    """Spread `purse` across up to `target_n` flips, sized to be fillable
+    within `sleep_hours` (instead of one all-in pick).
 
-    Three risk filters get applied before anything is ranked, since this
-    plan runs unattended while you're away:
-      - extreme-margin items are dropped entirely. A margin that wide is
-        as likely to be a stale/manipulated order book as a real
-        opportunity, and there's nobody watching to bail out if it's the
-        former.
-      - items whose CURRENT price has drifted far from their own local
-        7-day average price are dropped, regardless of margin - see
-        apply_price_deviation_flags. This catches manipulation that
-        extreme_margin alone can miss (a manipulated book doesn't always
-        produce a huge margin - sometimes both sides get pushed together).
-      - items whose trailing-week coin turnover is below
-        `min_daily_coin_volume` are dropped. They're technically alive
-        (they already cleared the global dead-item filter) but thin
-        enough that one unlucky order can leave you sitting on unsold
-        stock all night.
+    Filters out extreme-margin, price-deviation-suspect, and low-turnover
+    items first (this plan runs unattended, so it's stricter than the
+    general list). Remaining candidates are ranked by profit achievable
+    within the sleep window under an even per-slot budget, then water-filled
+    so a thin item can't hog a slot's worth of coins it can't actually place.
 
-    What's left is ranked by profit potential WITHIN the sleep window
-    itself (liquidity_units_over_horizon * profit), not by an
-    hours-independent score - so a shorter window genuinely favors
-    different (more immediately liquid) items than a longer one, instead
-    of just buying less of the same fixed list. Each candidate then takes
-    the smaller of an even per-slot share of what's left or what its own
-    liquidity over the window can absorb (water-fill), so a thin item
-    doesn't hog a slot's worth of coins it can't actually place.
-
-    Returns (portfolio_list, leftover_purse, risk_excluded_count).
-    Each item in portfolio_list is the original flip dict with "units",
-    "coins", and "profit_window" added.
+    Returns (portfolio_list, leftover_purse, risk_excluded_count). Each
+    portfolio item gets "units", "coins", "profit_window" added.
     """
     sleep_hours = max(0.1, sleep_hours)
     target_n = max(1, int(target_n))
@@ -656,7 +726,6 @@ def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume
     ]
     risk_excluded_count = len(base_pool) - len(candidates)
 
-    # Rank by profit achievable under an EVEN slot share of the purse, capped 
     avg_slot_budget = purse / target_n if target_n > 0 else purse
     for f in candidates:
         window_units = int(f["hourly_volume"] * sleep_hours)
@@ -689,6 +758,11 @@ def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume
         f["units"] = units
         f["coins"] = coins
         f["profit_window"] = round(units * f["profit"], 1)
+
+        fill_hours, sell_hours = compute_fill_sell_hours(f, units)
+        f["fill_hours"] = fill_hours
+        f["sell_hours"] = sell_hours
+
         portfolio.append(f)
         remaining_purse -= coins
 
@@ -704,8 +778,7 @@ def fmt_int(n):
 
 
 class VerticalScrollFrame(ttk.Frame):
-    """A frame whose contents can overflow vertically with a scrollbar +
-    mousewheel support. Used for the item box list."""
+    """Vertically-scrollable frame with mousewheel support, for the item list."""
     def __init__(self, parent, bg=BG_DARK):
         super().__init__(parent)
         self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0)
@@ -743,7 +816,7 @@ class VerticalScrollFrame(ttk.Frame):
 
 
 class HorizontalScrollFrame(ttk.Frame):
-    """A frame whose contents can overflow horizontally with a scrollbar."""
+    """Horizontally-scrollable frame, for the category pill bar."""
     def __init__(self, parent, bg=BG_DARK, height=44):
         super().__init__(parent)
         self.canvas = tk.Canvas(self, bg=bg, height=height, highlightthickness=0)
@@ -777,7 +850,7 @@ class HorizontalScrollFrame(ttk.Frame):
 
 
 def hoverable(widget, base_bg, hover_bg, fg=None, hover_fg=None):
-    """Attach simple hover-color behavior to a plain tk widget (Button/Label)."""
+    """Simple hover-color behavior for a plain tk widget (Button/Label)."""
     def on_enter(_e):
         widget.configure(bg=hover_bg)
         if hover_fg is not None:
@@ -793,15 +866,19 @@ def hoverable(widget, base_bg, hover_bg, fg=None, hover_fg=None):
 
 
 class FlipCard(tk.Frame):
-    """A collapsible box for one item. Header shows name/category/quick
-    number; tapping it expands a detail grid with every field inside."""
-    def __init__(self, parent, flip, mode, on_set_category, sleep_hours=None, on_blacklist=None):
+    """Collapsible box for one item. Header shows a quick summary; tapping
+    expands a detail grid with every field."""
+    def __init__(self, parent, flip, mode, on_set_category, sleep_hours=None, on_blacklist=None,
+                 market_context=None):
         super().__init__(parent, bg=BORDER_SUBTLE)
         self.flip = flip
         self.mode = mode
         self.expanded = False
         self.on_set_category = on_set_category
         self.on_blacklist = on_blacklist
+        # {"active_event_keys": set(...), "paul_discount_active": bool} - badges
+        # against what's ACTUALLY live now, not just keyword matches.
+        self.market_context = market_context or {}
 
         inner = tk.Frame(self, bg=BG_PANEL)
         inner.pack(fill="both", expand=True)
@@ -832,6 +909,22 @@ class FlipCard(tk.Frame):
         cat_lbl = tk.Label(header, text=flip["category"], font=FONT_PILL, bg=BG_PANEL, fg=TEXT_DIM)
         cat_lbl.pack(side="left", padx=(8, 0), pady=5)
 
+        # Only badge tags that are actually live now; other keyword matches
+        # are informational-only and shown in the detail view instead.
+        active_keys = self.market_context.get("active_event_keys", set())
+        badge_widgets = []
+        for key in flip.get("event_tags", []):
+            if key == "dungeon_supply":
+                show = self.market_context.get("paul_discount_active", False)
+            else:
+                show = key in active_keys
+            if not show:
+                continue
+            badge_text, badge_color2 = EVENT_BADGE_STYLE.get(key, (key, ACCENT))
+            badge_lbl = tk.Label(header, text=badge_text, font=FONT_PILL, bg=BG_PANEL, fg=badge_color2)
+            badge_lbl.pack(side="left", padx=(8, 0), pady=5)
+            badge_widgets.append(badge_lbl)
+
         self.arrow_lbl = tk.Label(header, text="\u25b6", font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_FAINT)
         self.arrow_lbl.pack(side="right", padx=(0, 10), pady=5)
 
@@ -847,8 +940,7 @@ class FlipCard(tk.Frame):
         self.detail = None
         self._sleep_hours_for_detail = sleep_hours
 
-        # click anywhere on the header to toggle
-        toggle_widgets = [header, name_lbl, cat_lbl, quick_lbl, self.arrow_lbl]
+        toggle_widgets = [header, name_lbl, cat_lbl, quick_lbl, self.arrow_lbl] + badge_widgets
         for w in toggle_widgets:
             w.bind("<Button-1>", self.toggle)
 
@@ -885,9 +977,14 @@ class FlipCard(tk.Frame):
             rows.append(("Units to Buy", f"{flip['units']:,}"))
             rows.append(("Coins to Invest", f"{flip['coins']:,.0f}"))
             rows.append((f"Expected Profit ({sleep_hours:g}h)", f"{flip['profit_window']:,.0f}"))
+            rows.append(("Est. Time to Fill Buy Order", fmt_hours(flip.get("fill_hours"))))
+            rows.append(("Est. Time to Sell", fmt_hours(flip.get("sell_hours"))))
         else:
             rows.append(("Achievable Units (this purse)", f"{flip.get('achievable_units', 0):,}"))
             rows.append(("Profit/hr (Purse)", fmt_num(flip.get("profit_hr", 0))))
+            fh, sh = compute_fill_sell_hours(flip, max(1, flip.get("achievable_units", 0)))
+            rows.append(("Est. Time to Fill Buy Order", fmt_hours(fh)))
+            rows.append(("Est. Time to Sell", fmt_hours(sh)))
 
         grid = tk.Frame(self.detail, bg=BG_PANEL_RAISED)
         grid.pack(fill="x", padx=16, pady=(8, 2))
@@ -900,11 +997,8 @@ class FlipCard(tk.Frame):
 
         if flip.get("extreme_margin"):
             tk.Label(self.detail,
-                     text=("\u26a0 Unusually high margin - this is often a volatile/thin order book "
-                           "that's already moved by the time you look in-game (Precursor Gear and "
-                           "similar expensive commodities are frequent repeat offenders). Always "
-                           "check the live in-game price before committing coins, even right after "
-                           "a fresh refresh."),
+                     text=("\u26a0 Unusually high margin - often a thin/stale order book that's "
+                           "already moved by the time you check in-game. Verify before trusting."),
                      font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=ACCENT_RED,
                      wraplength=900, justify="left").pack(anchor="w", padx=16, pady=(2, 6))
 
@@ -914,6 +1008,25 @@ class FlipCard(tk.Frame):
                            f"7-day local average - possible manipulation or a stale/spoofed order, "
                            f"verify in-game before trusting."),
                      font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=ACCENT_RED,
+                     wraplength=900, justify="left").pack(anchor="w", padx=16, pady=(2, 6))
+
+        # Show why an item is tagged even if the event isn't live right now,
+        # for planning ahead (header badge only shows currently-live tags).
+        if flip.get("event_tags"):
+            active_keys = self.market_context.get("active_event_keys", set())
+            lines = []
+            for key in flip["event_tags"]:
+                badge_text, _ = EVENT_BADGE_STYLE.get(key, (key, ACCENT))
+                if key == "dungeon_supply":
+                    live = self.market_context.get("paul_discount_active", False)
+                    note = ("Paul's Marauder perk is active - dungeon chests 20% cheaper" if live
+                            else "not currently affected - Paul/Marauder isn't in office")
+                else:
+                    live = key in active_keys
+                    note = "currently live" if live else "not currently running"
+                lines.append(f"{badge_text}: {note}")
+            tk.Label(self.detail, text="Seasonal relevance:\n" + "\n".join(lines),
+                     font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=TEXT_DIM,
                      wraplength=900, justify="left").pack(anchor="w", padx=16, pady=(2, 6))
 
         btn_row = tk.Frame(self.detail, bg=BG_PANEL_RAISED)
@@ -936,9 +1049,6 @@ class FlipCard(tk.Frame):
         if self.expanded:
             if self.detail is None:
                 self.detail = tk.Frame(self, bg=BG_PANEL_RAISED)
-                # re-parent detail under body_wrap equivalent: since detail's
-                # master must be a child of the same row, we place it as a
-                # sibling frame packed after the row itself.
                 self.detail.pack(fill="x")
                 self._build_detail(self._sleep_hours_for_detail)
             else:
@@ -951,7 +1061,7 @@ class FlipCard(tk.Frame):
 
 
 class CategoryDialog(tk.Toplevel):
-    """Small modal dialog to manually set/reset an item's category."""
+    """Small modal to manually set/reset an item's category."""
     def __init__(self, parent, item_name, current_category, existing_categories, on_save, on_reset):
         super().__init__(parent)
         self.title("Set Category")
@@ -1028,8 +1138,7 @@ class AddCategoryDialog(tk.Toplevel):
 
 
 class ManageCategoriesDialog(tk.Toplevel):
-    """Lists every category (custom + in-use). Lets you rename, delete,
-    or add new ones, all from one place."""
+    """List/rename/delete/add categories, all from one place."""
     def __init__(self, parent, categories, item_counts, on_add, on_rename, on_delete):
         super().__init__(parent)
         self.title("Manage Categories")
@@ -1126,12 +1235,8 @@ class ManageCategoriesDialog(tk.Toplevel):
 
 
 class SettingsDialog(tk.Toplevel):
-    """One place for every configurable option: trading parameters, the
-    theme accent color (color wheel), auto-refresh cadence, and the item
-    blacklist. Trading-parameter fields are bound directly to the SAME
-    StringVars the app already reads via _get_purse()/_get_sleep_hours()/
-    etc. - this dialog is now the only place those get edited, nothing
-    downstream had to change."""
+    """Trading parameters, theme accent color, auto-refresh cadence, and the
+    item blacklist. Trading fields bind directly to the app's own StringVars."""
     def __init__(self, app):
         super().__init__(app)
         self.app = app
@@ -1341,6 +1446,14 @@ class BazaarFlipperApp(tk.Tk):
         self.price_history = load_price_history()
         self.blacklist = set(load_json(BLACKLIST_PATH, []))
 
+        # Mayor/election context, seeded from the last-known cache so the UI
+        # has something to show before the first live fetch completes.
+        self.mayor_info = load_json(MAYOR_CACHE_PATH, {})
+        self.active_festivals = compute_active_festivals(self.mayor_info)
+        self.paul_discount_active = paul_dungeon_discount_active(self.mayor_info)
+        self.jerry_status = jerry_workshop_status()
+        self._recompute_active_event_keys()
+
         self.auto_refresh_enabled = bool(self.settings.get("auto_refresh_enabled", DEFAULT_AUTO_REFRESH_ENABLED))
         try:
             self.auto_refresh_minutes = max(MIN_AUTO_REFRESH_MINUTES,
@@ -1413,16 +1526,8 @@ class BazaarFlipperApp(tk.Tk):
     # -- widgets ----------------------------------------------------------
     def _build_widgets(self):
         # Row 1: refresh + settings + manage categories + view toggle.
-        # NOTE: this row used to also hold five separate Entry fields
-        # (Purse/Sleep/Spread/MinVol/BuyBuffer) plus an Apply button. On a
-        # non-maximized window those pushed the row wider than the visible
-        # area - pack() doesn't wrap, so the rightmost widgets (the
-        # Overnight Plan / Full List toggle) got squeezed off past the
-        # edge of the window instead of actually disappearing. Moving
-        # those five fields into the Settings dialog (they still write to
-        # the exact same StringVars, so nothing downstream changed) keeps
-        # this row short enough to never overflow a reasonably-sized
-        # window.
+        # Trading-parameter fields live in the Settings dialog, not here -
+        # keeps this row short enough to never overflow the window.
         top_bar_wrap = tk.Frame(self, bg=BG_DARK)
         top_bar_wrap.pack(fill="x")
         top_bar = ttk.Frame(top_bar_wrap, padding=(14, 14, 14, 14), style="TopBar.TFrame")
@@ -1430,9 +1535,6 @@ class BazaarFlipperApp(tk.Tk):
         tk.Frame(top_bar_wrap, bg=ACCENT, height=2).pack(fill="x")
         self.top_bar_wrap = top_bar_wrap
 
-        # StringVars for the trading parameters - no Entry widgets live in
-        # this bar anymore, they're edited from the Settings dialog, but
-        # every place that reads them (_get_purse etc.) is unchanged.
         self.purse_var = tk.StringVar(value=self.settings.get("purse", "10000000"))
         self.sleep_hours_var = tk.StringVar(value=self.settings.get("sleep_hours", str(DEFAULT_SLEEP_HOURS)))
         self.spread_var = tk.StringVar(value=self.settings.get("spread_n", str(DEFAULT_SPREAD_N)))
@@ -1457,7 +1559,7 @@ class BazaarFlipperApp(tk.Tk):
                                         command=lambda: self.set_view("full"))
         self.fulllist_btn.pack(side="left")
 
-        # Row 2: search + sort (Full List) / category pills - only shown in Full List view
+        # Row 2: search + sort (Full List) / category pills - Full List view only
         self.category_bar_wrap = ttk.Frame(self, padding=(14, 10, 14, 6))
 
         filter_row = ttk.Frame(self.category_bar_wrap)
@@ -1491,11 +1593,13 @@ class BazaarFlipperApp(tk.Tk):
         self.snapshot_age_lbl = ttk.Label(status_bar, textvariable=self.snapshot_age_var, style="Dim.TLabel")
         self.snapshot_age_lbl.pack(side="left", padx=(14, 0))
 
+        self.events_var = tk.StringVar(value=self._events_status_text())
+        ttk.Label(status_bar, textvariable=self.events_var, style="Dim.TLabel").pack(side="left", padx=(14, 0))
+
         self.update_available_var = tk.StringVar(value="")
         self.update_lbl = tk.Label(status_bar, textvariable=self.update_available_var, font=FONT_BOLD,
                                     bg=BG_DARK, fg=ACCENT_GREEN, cursor="hand2")
-        self.update_lbl.bind("<Button-1>", lambda e: webbrowser.open(self._update_release_url) if
-                              getattr(self, "_update_release_url", None) else None)
+        self.update_lbl.bind("<Button-1>", self._on_update_click)
         # not packed until an update is actually found - see _show_update_available
 
         self.count_var = tk.StringVar(value="")
@@ -1503,7 +1607,7 @@ class BazaarFlipperApp(tk.Tk):
         ttk.Label(status_bar, text="Tip: tap any item box below to expand its full details",
                   style="Dim.TLabel").pack(side="right", padx=16)
 
-        # Summary card, with a colored accent stripe down the left edge
+        # Summary card
         card_wrap = tk.Frame(self, bg=BG_DARK)
         card_wrap.pack(fill="x", padx=14, pady=(0, 12))
         tk.Frame(card_wrap, bg=ACCENT, width=4).pack(side="left", fill="y")
@@ -1539,8 +1643,7 @@ class BazaarFlipperApp(tk.Tk):
         self.fulllist_btn.configure(style="ViewActive.TButton" if self.view_mode == "full" else "View.TButton")
 
     def get_all_categories(self):
-        """Union of categories currently in use by flips + custom ones the
-        user has created (which may not have any items yet)."""
+        """Union of categories in use + custom ones (may have no items yet)."""
         in_use = {f["category"] for f in self.all_flips}
         return sorted(in_use | self.custom_categories)
 
@@ -1582,7 +1685,6 @@ class BazaarFlipperApp(tk.Tk):
 
             self.category_buttons[cat] = pill
 
-        # "+ New" shortcut pill, visually distinct (outlined, dashed feel)
         add_pill = tk.Label(self.category_scroll.inner, text="+ New", font=FONT_PILL,
                              bg=BG_DARK, fg=ACCENT, padx=12, pady=7, cursor="hand2",
                              highlightbackground=ACCENT, highlightthickness=1)
@@ -1601,10 +1703,8 @@ class BazaarFlipperApp(tk.Tk):
         SettingsDialog(self)
 
     def _schedule_auto_refresh(self):
-        """(Re)schedules the next automatic refresh. Always cancels any
-        pending one first, so changing the interval or toggling it off in
-        Settings can't leave a stray timer still firing on the old
-        cadence."""
+        """(Re)schedule the next auto-refresh; always cancels any pending
+        one first so an interval/toggle change can't leave a stray timer."""
         if self._auto_refresh_after_id is not None:
             self.after_cancel(self._auto_refresh_after_id)
             self._auto_refresh_after_id = None
@@ -1618,14 +1718,12 @@ class BazaarFlipperApp(tk.Tk):
 
     # -- update checker -------------------------------------------------
     def _check_for_update_async(self, silent=False):
-        """Hits GitHub in a background thread (same pattern as the bazaar
-        fetch) so a slow/offline check never freezes the UI. silent=True
-        (used on startup) says nothing on failure or "already current" -
-        only a real update pops the status-bar notice. silent=False (the
-        Settings 'Check for Updates' button) always reports back."""
+        """Background GitHub check so a slow/offline check never freezes the
+        UI. silent=True (startup) says nothing unless a real update exists;
+        silent=False (Settings button) always reports back."""
         def worker():
             try:
-                available, latest, url = check_for_update()
+                available, latest, url, asset_url = check_for_update()
             except Exception:
                 if not silent:
                     self.after(0, lambda: messagebox.showinfo(
@@ -1634,16 +1732,131 @@ class BazaarFlipperApp(tk.Tk):
                         "GITHUB_REPO in the script points at a real repo with a published release."))
                 return
             if available:
-                self.after(0, lambda: self._show_update_available(latest, url))
+                self.after(0, lambda: self._show_update_available(latest, url, asset_url))
             elif not silent:
                 self.after(0, lambda: messagebox.showinfo(
                     "Update Check", f"You're on the latest version (v{APP_VERSION})."))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_update_available(self, latest_version, url):
-        self._update_release_url = url
-        self.update_available_var.set(f"\u2b06 Update available: {latest_version} (click to download)")
+    def _show_update_available(self, latest_version, release_url, asset_url):
+        """Light up the clickable status-bar banner. If a .exe asset was
+        found, clicking auto-installs it; otherwise opens the release page."""
+        self._update_release_url = release_url
+        self._update_asset_url = asset_url
+        if asset_url:
+            self.update_available_var.set(f"\u2b06 Update available: {latest_version} (click to install)")
+        else:
+            self.update_available_var.set(f"\u2b06 Update available: {latest_version} (click to download)")
         self.update_lbl.pack(side="left", padx=(14, 0))
+
+    def _on_update_click(self, _event=None):
+        """Prefer the auto-install path; fall back to opening the release page."""
+        if getattr(self, "_update_asset_url", None):
+            self._apply_update(self._update_asset_url)
+        elif getattr(self, "_update_release_url", None):
+            webbrowser.open(self._update_release_url)
+
+    def _apply_update(self, download_url):
+        """Download the release zip, extract to %TEMP%, then hand off to a
+        batch script (see _launch_update_and_restart) that waits for this
+        process to exit, mirrors the update over the install folder, and
+        relaunches - a running .exe can't overwrite its own files while open.
+
+        Only applies when frozen (packaged .exe); running the raw .py just
+        opens the browser instead, since there's no installed folder."""
+        if not getattr(sys, "frozen", False):
+            webbrowser.open(self._update_release_url)
+            return
+
+        self.update_lbl.unbind("<Button-1>")
+        self.update_available_var.set("\u2b07 Downloading update...")
+
+        def worker():
+            current_exe = sys.executable
+            exe_name = os.path.basename(current_exe)
+
+            work_dir = os.path.join(tempfile.gettempdir(), "BazaarFlipperUpdate")
+            zip_path = os.path.join(work_dir, "update.zip")
+            extract_dir = os.path.join(work_dir, "extracted")
+
+            try:
+                if os.path.exists(work_dir):
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                os.makedirs(extract_dir, exist_ok=True)
+
+                with requests.get(download_url, stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    expected_size = int(r.headers.get("Content-Length", 0))
+                    written = 0
+                    with open(zip_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=262144):
+                            if chunk:
+                                f.write(chunk)
+                                written += len(chunk)
+                if expected_size and written != expected_size:
+                    raise IOError(f"Incomplete download: got {written} of {expected_size} bytes")
+
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(extract_dir)
+
+                # zip may nest the app folder one level deep - search for
+                # wherever the exe actually ended up.
+                source_dir = None
+                for root, _dirs, files in os.walk(extract_dir):
+                    if exe_name in files:
+                        source_dir = root
+                        break
+                if source_dir is None:
+                    raise FileNotFoundError(
+                        f"Couldn't find {exe_name} anywhere inside the downloaded update - "
+                        f"the release zip may not contain a valid build.")
+            except Exception as exc:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                self.after(0, lambda: self._on_update_download_failed(exc))
+                return
+            self.after(0, lambda: self._launch_update_and_restart(current_exe, source_dir, work_dir))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_download_failed(self, exc):
+        self.update_available_var.set("\u2b06 Update available (download failed, click to retry)")
+        self.update_lbl.bind("<Button-1>", self._on_update_click)
+        messagebox.showerror("Update failed", f"Couldn't download the update:\n{exc}")
+
+    def _launch_update_and_restart(self, current_exe, source_dir, work_dir):
+        """Write a batch script (in %TEMP%, outside the install folder) that
+        waits for this exe to exit, robocopy /MIR's the update over the
+        install folder, relaunches, and cleans up. Launched console-less so
+        it survives after this process exits. Windows-only."""
+        exe_dir = os.path.dirname(current_exe)
+        exe_name = os.path.basename(current_exe)
+        bat_path = os.path.join(work_dir, "_apply_update.bat")
+
+        bat_contents = (
+            "@echo off\r\n"
+            ":wait\r\n"
+            f'tasklist /fi "imagename eq {exe_name}" | find /i "{exe_name}" >nul\r\n'
+            "if not errorlevel 1 (\r\n"
+            "    timeout /t 1 /nobreak >nul\r\n"
+            "    goto wait\r\n"
+            ")\r\n"
+            "timeout /t 2 /nobreak >nul\r\n"
+            f'robocopy "{source_dir}" "{exe_dir}" /E /MIR /R:3 /W:1 >nul\r\n'
+            f'start "" "{current_exe}"\r\n'
+            f'rmdir /s /q "{work_dir}"\r\n'
+            'del "%~f0"\r\n'
+        )
+        with open(bat_path, "w") as f:
+            f.write(bat_contents)
+
+        subprocess.Popen(["cmd", "/c", bat_path],
+                          creationflags=subprocess.CREATE_NO_WINDOW,
+                          close_fds=True)
+
+        if self._auto_refresh_after_id is not None:
+            self.after_cancel(self._auto_refresh_after_id)
+        self.destroy()
+        sys.exit(0)
 
     # -- category management (add / rename / delete) ------------------------
     def open_add_category(self):
@@ -1701,7 +1914,7 @@ class BazaarFlipperApp(tk.Tk):
 
         ManageCategoriesDialog(self, self.get_all_categories(), counts, on_add, on_rename, on_delete)
 
-    # -- manual categorization (per-item, via the "Set Category" button in a box) --
+    # -- manual categorization (per-item, via "Set Category" in a box) --
     def open_category_dialog(self, product_id):
         flip = next((f for f in self.all_flips if f["id"] == product_id), None)
         if not flip:
@@ -1739,6 +1952,37 @@ class BazaarFlipperApp(tk.Tk):
         save_json(BLACKLIST_PATH, sorted(self.blacklist))
         self.recompute_and_render()
 
+    # -- seasonal events / mayor -----------------------------------------
+    def _recompute_active_event_keys(self):
+        """Set of event_keys that are ACTUALLY live right now - what
+        FlipCard badges/filters against. dungeon_supply is excluded here;
+        it's driven directly by paul_discount_active, not a festival window."""
+        keys = {f["event_key"] for f in self.active_festivals if f["active_now"]}
+        if self.jerry_status.get("active"):
+            keys.add("jerry_workshop")
+        self.active_event_keys = keys
+
+    def _market_context(self):
+        return {
+            "active_event_keys": getattr(self, "active_event_keys", set()),
+            "paul_discount_active": self.paul_discount_active,
+        }
+
+    def _events_status_text(self):
+        """Human-readable "what's live now" summary for the status bar."""
+        parts = []
+        mayor_name = self.mayor_info.get("name")
+        if mayor_name:
+            parts.append(f"Mayor: {mayor_name}")
+        live_labels = [f["label"] for f in self.active_festivals if f["active_now"]]
+        if self.jerry_status.get("active"):
+            live_labels.append("Jerry's Workshop")
+        if self.paul_discount_active:
+            live_labels.append("Paul \u201320% Chests")
+        if live_labels:
+            parts.append("Active: " + ", ".join(live_labels))
+        return "  \u00b7  ".join(parts)
+
     # -- data flow ----------------------------------------------------------
     def refresh(self):
         self.refresh_btn.state(["disabled"])
@@ -1753,21 +1997,36 @@ class BazaarFlipperApp(tk.Tk):
             self.price_history = record_and_prune_price_history(self.price_history, flips)
             flips = apply_price_deviation_flags(flips, self.price_history)
             snapshot_ms = bazaar_data.get("lastUpdated", 0)
-            self.after(0, self._on_fetch_success, category_map, flips, snapshot_ms)
         except Exception as exc:
             self.after(0, self._on_fetch_error, exc)
+            return
 
-    def _on_fetch_success(self, category_map, flips, snapshot_ms):
+        # Election data is a separate endpoint and shouldn't block the
+        # bazaar refresh everything else depends on if it fails.
+        mayor_info = None
+        try:
+            mayor_info = fetch_mayor_info()
+            save_json(MAYOR_CACHE_PATH, mayor_info)
+        except Exception:
+            pass
+
+        self.after(0, self._on_fetch_success, category_map, flips, snapshot_ms, mayor_info)
+
+    def _on_fetch_success(self, category_map, flips, snapshot_ms, mayor_info=None):
         self.category_map = category_map
         self.all_flips = flips
         self.status_var.set("Bazaar data loaded successfully")
         self.refresh_btn.state(["!disabled"])
 
-        # snapshot_ms is Hypixel's OWN capture time for this data (ms since
-        # epoch), not our fetch time - the two can differ if their backend
-        # served a cached response. snapshot_local_ref is our local clock
-        # at the moment we received it, so the ticking "Xs old" label below
-        # stays accurate between refreshes without re-hitting the API.
+        if mayor_info:
+            self.mayor_info = mayor_info
+        self.active_festivals = compute_active_festivals(self.mayor_info)
+        self.paul_discount_active = paul_dungeon_discount_active(self.mayor_info)
+        self.jerry_status = jerry_workshop_status()
+        self._recompute_active_event_keys()
+        self.events_var.set(self._events_status_text())
+
+        # snapshot_ms is Hypixel's own capture time, not our fetch time.
         self.last_snapshot_ms = snapshot_ms
         self.last_snapshot_local_ref = time.time()
         self._tick_snapshot_age()
@@ -1777,9 +2036,7 @@ class BazaarFlipperApp(tk.Tk):
         self.recompute_and_render()
 
     def _tick_snapshot_age(self):
-        """Keeps the 'Hypixel snapshot: Xs old' label live between fetches,
-        so staleness is visible even if you sit on the same screen for a
-        while rather than only right after a refresh."""
+        """Keep the 'snapshot: Xs old' label live between fetches."""
         if getattr(self, "last_snapshot_ms", 0):
             elapsed_since_capture = time.time() - (self.last_snapshot_ms / 1000.0)
             elapsed_since_capture = max(0, elapsed_since_capture)
@@ -1835,8 +2092,7 @@ class BazaarFlipperApp(tk.Tk):
             return DEFAULT_BUY_BUFFER_PCT
 
     def _filtered_flips(self):
-        # Blacklisted items are excluded everywhere - both the Overnight
-        # Plan and the Full List are built from this same filtered set.
+        # Blacklisted items are excluded everywhere.
         flips = [f for f in self.all_flips if f["id"] not in self.blacklist]
 
         if self.view_mode == "full":
@@ -1852,7 +2108,6 @@ class BazaarFlipperApp(tk.Tk):
 
     # -- search debounce -----------------------------------------------------
     def _on_search_key(self):
-
         if self._search_after_id is not None:
             self.after_cancel(self._search_after_id)
         self._full_list_shown = self._full_list_page_size
@@ -1953,9 +2208,11 @@ class BazaarFlipperApp(tk.Tk):
                      f"or off their own 7-day local average price - verify before trusting, or "
                      f"blacklist them from the item's detail view. Tap an item for its full details.")
 
+        market_context = self._market_context()
         for f in visible_rows:
             card = FlipCard(self.cards_scroll.inner, f, mode, self.open_category_dialog,
-                             sleep_hours=sleep_hours, on_blacklist=self.blacklist_item)
+                             sleep_hours=sleep_hours, on_blacklist=self.blacklist_item,
+                             market_context=market_context)
             card.pack(fill="x", pady=1)
 
         if self.view_mode == "full" and more_remaining > 0:
