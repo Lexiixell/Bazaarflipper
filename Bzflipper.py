@@ -141,6 +141,297 @@ DEFAULT_PLAN_MIN_DAILY_VOLUME = MIN_DAILY_COIN_VOLUME * 4  # the Overnight Plan
     # all) - thin-but-technically-alive items are exactly the ones most
     # likely to stall out or get manipulated while you're asleep.
 
+# ---- Skyblock calendar --------------------------------------------------
+# Hypixel exposes no "current skyblock date" API field - the calendar is
+# entirely derivable from wall-clock time against a fixed epoch, since
+# SkyBlock time always runs at a constant rate (confirmed via Hypixel's
+# own SkyBlock Time wiki page). Constants below are the documented values,
+# not guesses:
+#   - SKYBLOCK_EPOCH_SECONDS: unix time of "1st of Early Spring, Year 1,
+#     00:00" - everything else is computed as an offset from this.
+#   - a SkyBlock day is 20 real minutes (1200s); a month is 31 SkyBlock
+#     days; a year is 12 months (372 SkyBlock days total).
+SKYBLOCK_EPOCH_SECONDS = 1560275700
+SKYBLOCK_DAY_SECONDS = 1200
+SKYBLOCK_DAYS_PER_MONTH = 31
+SKYBLOCK_MONTHS_PER_YEAR = 12
+SKYBLOCK_MONTH_NAMES = [
+    "Early Spring", "Spring", "Late Spring",
+    "Early Summer", "Summer", "Late Summer",
+    "Early Autumn", "Autumn", "Late Autumn",
+    "Early Winter", "Winter", "Late Winter",
+]
+# Index of "Late Winter" - the SkyBlock month Jerry's Workshop opens for
+# (on top of the separate real-life-December override below).
+LATE_WINTER_MONTH_INDEX = 11
+# The SB-calendar trigger only holds the Workshop open for the first 10
+# real hours of Late Winter (it recurs roughly every 5 days 4 hours since
+# that's how long a full SB year takes) - it does NOT stay open the whole
+# month via the SB-time path. The real-life-December path below is what
+# covers the rest of that month for northern-hemisphere players.
+JERRY_WORKSHOP_WINDOW_SECONDS = 10 * 3600
+
+
+def get_skyblock_date(timestamp=None):
+    """Converts a unix timestamp (default: now) into
+    (year, month_index, month_name, day) SkyBlock calendar coordinates.
+    year is 1-indexed, month_index is 0-indexed into SKYBLOCK_MONTH_NAMES,
+    day is 1-indexed within the month (1..31)."""
+    if timestamp is None:
+        timestamp = time.time()
+    elapsed = max(0, timestamp - SKYBLOCK_EPOCH_SECONDS)
+    total_sb_days = int(elapsed // SKYBLOCK_DAY_SECONDS)
+    days_per_year = SKYBLOCK_DAYS_PER_MONTH * SKYBLOCK_MONTHS_PER_YEAR
+    year = total_sb_days // days_per_year + 1
+    day_in_year = total_sb_days % days_per_year
+    month_index = day_in_year // SKYBLOCK_DAYS_PER_MONTH
+    day = day_in_year % SKYBLOCK_DAYS_PER_MONTH + 1
+    return year, month_index, SKYBLOCK_MONTH_NAMES[month_index], day
+
+
+def jerry_workshop_status(now=None):
+    """Whether Jerry's Workshop (the Winter Island) is currently open, and
+    why. It opens under EITHER of two independent conditions (per the
+    Hypixel wiki):
+      - the SkyBlock calendar is in Late Winter, for the first 10 real
+        hours of that month, OR
+      - it's real-life December (Hypixel keeps it open the whole month,
+        separately from the SkyBlock-time trigger, so players get a full
+        real-life month of it once a year on top of the recurring
+        in-game window).
+    Real-life-December is checked against the local machine's own clock -
+    close enough for a "should I care about this today" flag without
+    pulling in a timezone database dependency for a cosmetic edge case
+    around midnight on Nov 30/Dec 1."""
+    if now is None:
+        now = time.time()
+    year, month_index, month_name, day = get_skyblock_date(now)
+    elapsed = max(0, now - SKYBLOCK_EPOCH_SECONDS)
+    total_sb_days = int(elapsed // SKYBLOCK_DAY_SECONDS)
+    seconds_into_current_day = elapsed - total_sb_days * SKYBLOCK_DAY_SECONDS
+    seconds_into_month = (day - 1) * SKYBLOCK_DAY_SECONDS + seconds_into_current_day
+
+    sb_window_open = (month_index == LATE_WINTER_MONTH_INDEX
+                       and seconds_into_month < JERRY_WORKSHOP_WINDOW_SECONDS)
+    real_december_open = (time.localtime(now).tm_mon == 12)
+
+    reasons = []
+    if sb_window_open:
+        reasons.append(f"SkyBlock Late Winter opening window (Year {year}, day {day}/31)")
+    if real_december_open:
+        reasons.append("real-life December")
+
+    return {
+        "active": sb_window_open or real_december_open,
+        "reasons": reasons,
+        "skyblock_year": year,
+        "skyblock_month": month_name,
+        "skyblock_day": day,
+    }
+
+
+# ---- Mayor / election API + seasonal event windows -----------------------
+# Hypixel's election endpoint returns the CURRENTLY ELECTED mayor plus
+# their minister (a second candidate who lost the mayoral race but still
+# grants their own single perk for the term) - both matter here, since
+# either one can be carrying a festival-triggering perk.
+MAYOR_URL = "https://api.hypixel.net/v2/resources/skyblock/election"
+
+# Mayor/minister perks that turn on a recurring seasonal bazaar-relevant
+# event, mapped to a normalized event key. Deliberately NOT tracking Year
+# of the Pig / Scorpius (Foxy) / Marina's Seal Perk / Mayor Fear here -
+# only the ones worth wiring into flip logic right now.
+FESTIVAL_PERK_EVENTS = {
+    "Fishing Festival": "fishing_festival",        # Marina
+    "Mining Fiesta": "mining_fiesta",               # Cole
+    "Mythological Ritual": "mythological_ritual",   # Diana
+}
+# Paul's signature perk: 20% off dungeon-related NPC costs. Doesn't touch
+# bazaar order prices directly, but several bazaar-tradeable dungeon-drop
+# materials have their effective "replacement cost" tied to an NPC-priced
+# recipe, so this flag lets the UI note the discount wherever those items
+# show up.
+PAUL_DUNGEON_DISCOUNT_PERK = "Marauder"
+PAUL_DUNGEON_DISCOUNT_PCT = 20.0
+
+# Within-month scheduling for the two perk-triggered events that don't run
+# for a mayor's whole term (start_day, end_day), 1-indexed inclusive:
+#   - Fishing Festival: the first 3 days of every month, for as long as
+#     Marina/her perk is active.
+#   - Mining Fiesta: days 1-7 of five specific SB months per Cole's term
+#     (Summer .. Late Autumn - indices 4-8 into SKYBLOCK_MONTH_NAMES).
+# Mythological Ritual has no sub-window - Diana's perk runs for her whole
+# term (a full SkyBlock year), so it's simply "active whenever she holds
+# the perk" (see compute_active_festivals).
+FISHING_FESTIVAL_DAYS = (1, 3)
+MINING_FIESTA_DAYS = (1, 7)
+MINING_FIESTA_MONTH_INDICES = {4, 5, 6, 7, 8}  # Summer .. Late Autumn
+
+
+def fetch_mayor_info():
+    """Fetch the current mayor + minister from Hypixel's election resource
+    and normalize into a small dict. Raises on network/HTTP failure - this
+    is supplementary market context, so callers should treat a failure as
+    non-fatal (fall back to cached info) rather than blocking the core
+    bazaar refresh everything else depends on."""
+    response = requests.get(MAYOR_URL, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("success"):
+        return {}
+
+    mayor = data.get("mayor") or {}
+    perks = [p.get("name") for p in (mayor.get("perks") or []) if p.get("name")]
+    minister = mayor.get("minister") or {}
+    minister_perk = (minister.get("perk") or {}).get("name")
+
+    return {
+        "name": mayor.get("name"),
+        "perks": perks,
+        "minister_name": minister.get("name"),
+        "minister_perk": minister_perk,
+    }
+
+
+def compute_active_festivals(info, now=None):
+    """Given fetch_mayor_info()'s output, figures out which of the
+    perk-gated seasonal events (Fishing Festival / Mining Fiesta /
+    Mythological Ritual) are currently running - both WHO holds the
+    triggering perk (mayor's own perks, or the minister's single perk)
+    and, for the two that have an in-month schedule, WHEN in the current
+    SkyBlock month it actually fires. A mayor merely holding the perk
+    doesn't mean the festival is live at this exact moment; it means it's
+    scheduled to recur, and only actually running during its window.
+
+    Returns a list of dicts: {"label", "event_key", "source",
+    "active_now", "window"}. "active_now" separates "this mayor's term
+    makes this event possible" from "it's actually happening right now" -
+    callers tagging bazaar items for right-now relevance should filter on
+    active_now."""
+    if not info:
+        return []
+    if now is None:
+        now = time.time()
+    _, month_index, _, day = get_skyblock_date(now)
+
+    candidates = []
+    for name in info.get("perks", []) or []:
+        candidates.append((name, info.get("name")))
+    if info.get("minister_perk"):
+        candidates.append((info["minister_perk"], info.get("minister_name")))
+
+    active = []
+    seen = set()
+    for perk_name, source in candidates:
+        event_key = FESTIVAL_PERK_EVENTS.get(perk_name)
+        if not event_key or perk_name in seen:
+            continue
+        seen.add(perk_name)
+
+        window = None
+        active_now = True
+        if event_key == "fishing_festival":
+            window = FISHING_FESTIVAL_DAYS
+            active_now = window[0] <= day <= window[1]
+        elif event_key == "mining_fiesta":
+            window = MINING_FIESTA_DAYS
+            active_now = (month_index in MINING_FIESTA_MONTH_INDICES
+                           and window[0] <= day <= window[1])
+        # mythological_ritual: no sub-window, active for the whole term.
+
+        active.append({
+            "label": perk_name,
+            "event_key": event_key,
+            "source": source,
+            "active_now": active_now,
+            "window": window,
+        })
+    return active
+
+
+def paul_dungeon_discount_active(info):
+    """True if the current mayor OR minister is carrying Paul's Marauder
+    perk (20% cheaper dungeon NPC costs). Flagged as context on relevant
+    bazaar items, not baked into the price math itself - the bazaar price
+    already reflects whatever real supply change occurred; there's no
+    reliable way to separately quantify "how much of today's price is
+    because of Paul" from the snapshot alone."""
+    if not info:
+        return False
+    if PAUL_DUNGEON_DISCOUNT_PERK in (info.get("perks") or []):
+        return True
+    return info.get("minister_perk") == PAUL_DUNGEON_DISCOUNT_PERK
+
+
+# Lightweight keyword tagging so relevant bazaar items can be flagged with
+# which seasonal event/mayor perk affects their supply/demand right now.
+# Keyword-based rather than an exhaustive ID list, since Hypixel adds new
+# event items periodically - this stays useful without needing to be
+# hand-updated every content patch, at the cost of occasionally tagging
+# something unrelated that happens to share a word (acceptable for an
+# informational badge, not something the profit math depends on).
+EVENT_ITEM_KEYWORDS = {
+    "mining_fiesta": ["REFINED_MINERAL", "GLOSSY_GEMSTONE", "MINERAL", "GEMSTONE",
+                       "MITHRIL_ORE", "TITANIUM_ORE"],
+    "fishing_festival": ["SHARK", "PRISMARINE", "MAGMA_FISH"],
+    "mythological_ritual": ["GRIFFIN", "ANCIENT_CLAW", "MYTHOLOGICAL", "PANDORA",
+                             "DAEDALUS", "MEDUSA", "TITAN", "SIREN", "MINOS"],
+    "jerry_workshop": ["GIFT", "NORTH_STAR", "SNOW", "ICE_", "JERRY", "GINGERBREAD",
+                        "CANDY_CANE", "FROZEN", "WALNUT", "STOCKING"],
+    "spooky_festival": ["CANDY_CORN", "MUTANT_ENDERMAN"],
+    "dungeon_supply": ["ESSENCE_", "RECOMBOBULATOR", "FUMING_POTATO_BOOK", "SHADOW_FURY",
+                        "NECRON", "SCYLLA", "STORM_", "GOLDOR", "MAXOR"],
+}
+
+
+def tag_event_relevance(product_id):
+    """Returns the list of event_keys (from EVENT_ITEM_KEYWORDS) whose
+    keywords appear in this bazaar product id. Used to badge items in the
+    UI that a currently-active (or currently-inactive) seasonal event or
+    Paul's dungeon discount is likely to affect."""
+    return [key for key, keywords in EVENT_ITEM_KEYWORDS.items()
+            if any(kw in product_id for kw in keywords)]
+
+
+# ---- Fill-time / sell-time estimates --------------------------------------
+def compute_fill_sell_hours(flip, units):
+    """Rough estimated real-world hours to (a) get `units` filled on the
+    BUY side (your buy order being matched by sellers) and (b) get them
+    filled on the SELL side (your sell offer being matched by buyers),
+    based on the item's own trailing 7-day moving volume as a stand-in
+    for its typical daily flow.
+
+    This is the same trailing-week-volume basis the rest of the app
+    already uses for liquidity (hourly_volume/daily_coin_volume), just
+    expressed as "how long would MY order take" instead of "how much
+    volume exists" - sellMovingWeek is the flow of players selling INTO
+    the bazaar, which is what fills a buy order; buyMovingWeek is the
+    flow of players buying FROM the bazaar, which is what fills a sell
+    offer. Returns (fill_hours, sell_hours), either being None if that
+    side's weekly volume is 0 (no basis to estimate from - fails open
+    rather than reporting a misleading instant/infinite fill)."""
+    sell_daily = flip.get("sell_moving_week", 0) / 7
+    buy_daily = flip.get("buy_moving_week", 0) / 7
+    fill_hours = (units / sell_daily * 24) if sell_daily > 0 else None
+    sell_hours = (units / buy_daily * 24) if buy_daily > 0 else None
+    return fill_hours, sell_hours
+
+
+def fmt_hours(hours):
+    """Formats an estimated hours figure the way a player actually thinks
+    about it - minutes when it's under an hour, hours to 1 decimal under a
+    day, days beyond that. Returns an em dash for unknown/None (no
+    turnover data to estimate from) rather than a misleading "0"."""
+    if hours is None:
+        return "\u2014"
+    hours = max(0, hours)
+    if hours < 1:
+        return f"{hours * 60:.0f}m"
+    if hours < 24:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
+
+
 # ---- Persistent app-data folder ---------------------------------------
 def get_app_data_dir():
     """Returns (and creates) a per-user folder to store this app's data.
@@ -162,6 +453,11 @@ SETTINGS_PATH = os.path.join(APP_DATA_DIR, "settings.json")
 CUSTOM_CATEGORIES_PATH = os.path.join(APP_DATA_DIR, "custom_categories.json")
 PRICE_HISTORY_PATH = os.path.join(APP_DATA_DIR, "price_history.json")
 BLACKLIST_PATH = os.path.join(APP_DATA_DIR, "blacklist.json")
+MAYOR_CACHE_PATH = os.path.join(APP_DATA_DIR, "mayor_cache.json")  # last-known mayor/
+    # election info, so a failed election-API fetch (it's a separate
+    # endpoint from the bazaar, and can fail independently) falls back to
+    # the last thing we successfully saw instead of blanking out every
+    # event badge in the app.
 
 
 def load_json(path, default):
@@ -195,6 +491,7 @@ ACCENT_SOFT = "#3a2f57"
 ACCENT_GREEN = "#4ade80"
 ACCENT_YELLOW = "#facc15"
 ACCENT_RED = "#f87171"
+ACCENT_BLUE = "#60a5fa"
 TEXT_MAIN = "#eceaf6"
 TEXT_DIM = "#9694ac"
 TEXT_FAINT = "#65637a"
@@ -281,6 +578,21 @@ DETAIL_FIELDS = [
     ("volume",        "Daily Volume"),
     ("weekly_volume", "Weekly Volume (7d)"),
 ]
+
+# Short badge text + color for each event_key a flip might be tagged
+# with, shown next to the category pill when that event is CURRENTLY
+# relevant (either the seasonal window is open, or - for the standing
+# Paul discount - his perk is currently active). Kept separate from
+# EVENT_ITEM_KEYWORDS above since that table is about detection, this
+# one's about display.
+EVENT_BADGE_STYLE = {
+    "mining_fiesta":       ("\u26cf Mining Fiesta", ACCENT_YELLOW),
+    "fishing_festival":    ("\U0001F41F Fishing Festival", ACCENT_BLUE),
+    "mythological_ritual": ("\u2666 Mythological Ritual", ACCENT_GREEN),
+    "jerry_workshop":      ("\u2744 Jerry's Workshop", ACCENT_BLUE),
+    "spooky_festival":     ("\U0001F383 Spooky Festival", ACCENT_YELLOW),
+    "dungeon_supply":      ("\u2694 Paul -20% Chests", ACCENT_RED),
+}
 
 SORT_OPTIONS = [
     ("Profit/hr (Purse)", "profit_hr"),
@@ -474,6 +786,8 @@ def fetch_flips(category_map, overrides, bazaar_data):
             or "Uncategorized"
         )
 
+        event_tags = tag_event_relevance(product_id)
+
         flips.append({
             "id": product_id,
             "item": product_id.replace("_", " ").title(),
@@ -493,6 +807,9 @@ def fetch_flips(category_map, overrides, bazaar_data):
                                                                 # the friendlier averaged
                                                                 # "volume" figure above
             "daily_coin_volume": round(avg_daily_coin_volume),
+            "buy_moving_week": buy_moving_week,     # raw 7d moving totals, kept for
+            "sell_moving_week": sell_moving_week,   # fill/sell-time estimates
+            "event_tags": event_tags,               # keyword-matched seasonal-event tags
         })
 
     flips.sort(key=lambda x: x["profit"], reverse=True)
@@ -713,6 +1030,11 @@ def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume
         f["units"] = units
         f["coins"] = coins
         f["profit_window"] = round(units * f["profit"], 1)
+
+        fill_hours, sell_hours = compute_fill_sell_hours(f, units)
+        f["fill_hours"] = fill_hours
+        f["sell_hours"] = sell_hours
+
         portfolio.append(f)
         remaining_purse -= coins
 
@@ -819,13 +1141,19 @@ def hoverable(widget, base_bg, hover_bg, fg=None, hover_fg=None):
 class FlipCard(tk.Frame):
     """A collapsible box for one item. Header shows name/category/quick
     number; tapping it expands a detail grid with every field inside."""
-    def __init__(self, parent, flip, mode, on_set_category, sleep_hours=None, on_blacklist=None):
+    def __init__(self, parent, flip, mode, on_set_category, sleep_hours=None, on_blacklist=None,
+                 market_context=None):
         super().__init__(parent, bg=BORDER_SUBTLE)
         self.flip = flip
         self.mode = mode
         self.expanded = False
         self.on_set_category = on_set_category
         self.on_blacklist = on_blacklist
+        # market_context carries {"active_event_keys": set(...),
+        # "paul_discount_active": bool} so the card can badge itself
+        # against what's ACTUALLY live right now, not just what keywords
+        # matched on the item id.
+        self.market_context = market_context or {}
 
         inner = tk.Frame(self, bg=BG_PANEL)
         inner.pack(fill="both", expand=True)
@@ -856,6 +1184,24 @@ class FlipCard(tk.Frame):
         cat_lbl = tk.Label(header, text=flip["category"], font=FONT_PILL, bg=BG_PANEL, fg=TEXT_DIM)
         cat_lbl.pack(side="left", padx=(8, 0), pady=5)
 
+        # Event badge(s) - only shown for tags that are ACTUALLY live right
+        # now per market_context, not just keyword-matched on the item id.
+        # A keyword match with no live event is informational only and is
+        # left for the detail view rather than cluttering every header.
+        active_keys = self.market_context.get("active_event_keys", set())
+        badge_widgets = []
+        for key in flip.get("event_tags", []):
+            if key == "dungeon_supply":
+                show = self.market_context.get("paul_discount_active", False)
+            else:
+                show = key in active_keys
+            if not show:
+                continue
+            badge_text, badge_color2 = EVENT_BADGE_STYLE.get(key, (key, ACCENT))
+            badge_lbl = tk.Label(header, text=badge_text, font=FONT_PILL, bg=BG_PANEL, fg=badge_color2)
+            badge_lbl.pack(side="left", padx=(8, 0), pady=5)
+            badge_widgets.append(badge_lbl)
+
         self.arrow_lbl = tk.Label(header, text="\u25b6", font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_FAINT)
         self.arrow_lbl.pack(side="right", padx=(0, 10), pady=5)
 
@@ -872,7 +1218,7 @@ class FlipCard(tk.Frame):
         self._sleep_hours_for_detail = sleep_hours
 
         # click anywhere on the header to toggle
-        toggle_widgets = [header, name_lbl, cat_lbl, quick_lbl, self.arrow_lbl]
+        toggle_widgets = [header, name_lbl, cat_lbl, quick_lbl, self.arrow_lbl] + badge_widgets
         for w in toggle_widgets:
             w.bind("<Button-1>", self.toggle)
 
@@ -909,9 +1255,14 @@ class FlipCard(tk.Frame):
             rows.append(("Units to Buy", f"{flip['units']:,}"))
             rows.append(("Coins to Invest", f"{flip['coins']:,.0f}"))
             rows.append((f"Expected Profit ({sleep_hours:g}h)", f"{flip['profit_window']:,.0f}"))
+            rows.append(("Est. Time to Fill Buy Order", fmt_hours(flip.get("fill_hours"))))
+            rows.append(("Est. Time to Sell", fmt_hours(flip.get("sell_hours"))))
         else:
             rows.append(("Achievable Units (this purse)", f"{flip.get('achievable_units', 0):,}"))
             rows.append(("Profit/hr (Purse)", fmt_num(flip.get("profit_hr", 0))))
+            fh, sh = compute_fill_sell_hours(flip, max(1, flip.get("achievable_units", 0)))
+            rows.append(("Est. Time to Fill Buy Order", fmt_hours(fh)))
+            rows.append(("Est. Time to Sell", fmt_hours(sh)))
 
         grid = tk.Frame(self.detail, bg=BG_PANEL_RAISED)
         grid.pack(fill="x", padx=16, pady=(8, 2))
@@ -938,6 +1289,28 @@ class FlipCard(tk.Frame):
                            f"7-day local average - possible manipulation or a stale/spoofed order, "
                            f"verify in-game before trusting."),
                      font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=ACCENT_RED,
+                     wraplength=900, justify="left").pack(anchor="w", padx=16, pady=(2, 6))
+
+        # Seasonal-event context: show WHY this item is tagged, even for
+        # tags that aren't live right now (e.g. "Mining Fiesta affects this
+        # item, but isn't running this SkyBlock month") - useful context
+        # for planning ahead, distinct from the header badge which only
+        # shows currently-live tags.
+        if flip.get("event_tags"):
+            active_keys = self.market_context.get("active_event_keys", set())
+            lines = []
+            for key in flip["event_tags"]:
+                badge_text, _ = EVENT_BADGE_STYLE.get(key, (key, ACCENT))
+                if key == "dungeon_supply":
+                    live = self.market_context.get("paul_discount_active", False)
+                    note = ("Paul's Marauder perk is active - dungeon chests 20% cheaper" if live
+                            else "not currently affected - Paul/Marauder isn't in office")
+                else:
+                    live = key in active_keys
+                    note = "currently live" if live else "not currently running"
+                lines.append(f"{badge_text}: {note}")
+            tk.Label(self.detail, text="Seasonal relevance:\n" + "\n".join(lines),
+                     font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=TEXT_DIM,
                      wraplength=900, justify="left").pack(anchor="w", padx=16, pady=(2, 6))
 
         btn_row = tk.Frame(self.detail, bg=BG_PANEL_RAISED)
@@ -1365,6 +1738,16 @@ class BazaarFlipperApp(tk.Tk):
         self.price_history = load_price_history()
         self.blacklist = set(load_json(BLACKLIST_PATH, []))
 
+        # Mayor/election context - seeded from the last-known cache so the
+        # UI has *something* to show before the first live election fetch
+        # completes (or if that fetch ever fails - it's a separate
+        # endpoint from the bazaar and can fail independently).
+        self.mayor_info = load_json(MAYOR_CACHE_PATH, {})
+        self.active_festivals = compute_active_festivals(self.mayor_info)
+        self.paul_discount_active = paul_dungeon_discount_active(self.mayor_info)
+        self.jerry_status = jerry_workshop_status()
+        self._recompute_active_event_keys()
+
         self.auto_refresh_enabled = bool(self.settings.get("auto_refresh_enabled", DEFAULT_AUTO_REFRESH_ENABLED))
         try:
             self.auto_refresh_minutes = max(MIN_AUTO_REFRESH_MINUTES,
@@ -1514,6 +1897,9 @@ class BazaarFlipperApp(tk.Tk):
         self.snapshot_age_var = tk.StringVar(value="")
         self.snapshot_age_lbl = ttk.Label(status_bar, textvariable=self.snapshot_age_var, style="Dim.TLabel")
         self.snapshot_age_lbl.pack(side="left", padx=(14, 0))
+
+        self.events_var = tk.StringVar(value=self._events_status_text())
+        ttk.Label(status_bar, textvariable=self.events_var, style="Dim.TLabel").pack(side="left", padx=(14, 0))
 
         self.update_available_var = tk.StringVar(value="")
         self.update_lbl = tk.Label(status_bar, textvariable=self.update_available_var, font=FONT_BOLD,
@@ -1921,6 +2307,41 @@ class BazaarFlipperApp(tk.Tk):
         save_json(BLACKLIST_PATH, sorted(self.blacklist))
         self.recompute_and_render()
 
+    # -- seasonal events / mayor -----------------------------------------
+    def _recompute_active_event_keys(self):
+        """Rebuilds the set of event_keys that are ACTUALLY live right now
+        (as opposed to merely possible under the current mayor's term) -
+        this is what FlipCard badges/filters against. dungeon_supply is
+        deliberately excluded here since it's driven by paul_discount_active
+        directly, not a festival window."""
+        keys = {f["event_key"] for f in self.active_festivals if f["active_now"]}
+        if self.jerry_status.get("active"):
+            keys.add("jerry_workshop")
+        self.active_event_keys = keys
+
+    def _market_context(self):
+        return {
+            "active_event_keys": getattr(self, "active_event_keys", set()),
+            "paul_discount_active": self.paul_discount_active,
+        }
+
+    def _events_status_text(self):
+        """Short human-readable summary of what's currently live, shown in
+        the status bar so the Overnight Plan's event badges don't come out
+        of nowhere."""
+        parts = []
+        mayor_name = self.mayor_info.get("name")
+        if mayor_name:
+            parts.append(f"Mayor: {mayor_name}")
+        live_labels = [f["label"] for f in self.active_festivals if f["active_now"]]
+        if self.jerry_status.get("active"):
+            live_labels.append("Jerry's Workshop")
+        if self.paul_discount_active:
+            live_labels.append("Paul \u201320% Chests")
+        if live_labels:
+            parts.append("Active: " + ", ".join(live_labels))
+        return "  \u00b7  ".join(parts)
+
     # -- data flow ----------------------------------------------------------
     def refresh(self):
         self.refresh_btn.state(["disabled"])
@@ -1935,15 +2356,37 @@ class BazaarFlipperApp(tk.Tk):
             self.price_history = record_and_prune_price_history(self.price_history, flips)
             flips = apply_price_deviation_flags(flips, self.price_history)
             snapshot_ms = bazaar_data.get("lastUpdated", 0)
-            self.after(0, self._on_fetch_success, category_map, flips, snapshot_ms)
         except Exception as exc:
             self.after(0, self._on_fetch_error, exc)
+            return
 
-    def _on_fetch_success(self, category_map, flips, snapshot_ms):
+        # Election data is a separate endpoint from the bazaar and changes
+        # far less often (only when a new mayor is elected, every ~5 real
+        # days) - a failure here shouldn't block the bazaar refresh that
+        # everything else depends on, so it's fetched in its own try/except
+        # and just falls back to whatever was last cached on disk.
+        mayor_info = None
+        try:
+            mayor_info = fetch_mayor_info()
+            save_json(MAYOR_CACHE_PATH, mayor_info)
+        except Exception:
+            pass
+
+        self.after(0, self._on_fetch_success, category_map, flips, snapshot_ms, mayor_info)
+
+    def _on_fetch_success(self, category_map, flips, snapshot_ms, mayor_info=None):
         self.category_map = category_map
         self.all_flips = flips
         self.status_var.set("Bazaar data loaded successfully")
         self.refresh_btn.state(["!disabled"])
+
+        if mayor_info:
+            self.mayor_info = mayor_info
+        self.active_festivals = compute_active_festivals(self.mayor_info)
+        self.paul_discount_active = paul_dungeon_discount_active(self.mayor_info)
+        self.jerry_status = jerry_workshop_status()
+        self._recompute_active_event_keys()
+        self.events_var.set(self._events_status_text())
 
         # snapshot_ms is Hypixel's OWN capture time for this data (ms since
         # epoch), not our fetch time - the two can differ if their backend
@@ -2135,9 +2578,11 @@ class BazaarFlipperApp(tk.Tk):
                      f"or off their own 7-day local average price - verify before trusting, or "
                      f"blacklist them from the item's detail view. Tap an item for its full details.")
 
+        market_context = self._market_context()
         for f in visible_rows:
             card = FlipCard(self.cards_scroll.inner, f, mode, self.open_category_dialog,
-                             sleep_hours=sleep_hours, on_blacklist=self.blacklist_item)
+                             sleep_hours=sleep_hours, on_blacklist=self.blacklist_item,
+                             market_context=market_context)
             card.pack(fill="x", pady=1)
 
         if self.view_mode == "full" and more_remaining > 0:
