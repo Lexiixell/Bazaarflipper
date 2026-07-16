@@ -31,6 +31,7 @@ EXTREME_MARGIN_THRESHOLD = 150.0  # margins above this get flagged as
                                    # "unusually high - verify before trusting"
                                    # rather than treated as simply "great"
 ALL_CATEGORIES = "All"
+EVENT_FILTER_ALL = "All Events"
 DEFAULT_SLEEP_HOURS = 8
 DEFAULT_SPREAD_N = 12
 FULL_LIST_PAGE_SIZE = 40     # Full List renders this many item boxes at a
@@ -381,7 +382,7 @@ EVENT_ITEM_KEYWORDS = {
     "dungeon_supply": ["ESSENCE_UNDEAD", "ESSENCE_WITHER", "RECOMBOBULATOR",
                         "FUMING_POTATO_BOOK", "HOT_POTATO_BOOK", "PRECURSOR_GEAR",
                         "IMPLOSION_SCROLL", "SHADOW_WARP_SCROLL", "WITHER_SHIELD_SCROLL"
-                        "MASTER_STAR"],
+                        "FIRST_MASTER_STAR","SECOND_MASTER_STAR","THIRD_MASTER_STAR","FOURTH_MASTER_STAR","FIFTH_MASTER_STAR",],
 }
 
 
@@ -1887,6 +1888,22 @@ class BazaarFlipperApp(tk.Tk):
                                         command=self._toggle_sort_dir)
         self.sort_dir_btn.pack(side="left", padx=6)
 
+        # Event filter - lets you browse everything tagged for a given
+        # seasonal event/Paul's discount, independent of whether that
+        # event is live RIGHT NOW (that's what the header badge already
+        # shows) - e.g. "what's affected by Mining Fiesta" even while
+        # Cole isn't mayor, for planning ahead. Options are rebuilt from
+        # whatever event_tags actually show up in the current flip data
+        # (see _rebuild_event_filter_options), so it never offers an
+        # event with zero matching items.
+        ttk.Label(filter_row, text="Event:").pack(side="left", padx=(16, 6))
+        self.event_filter_var = tk.StringVar(value=EVENT_FILTER_ALL)
+        self.event_filter_combo = ttk.Combobox(filter_row, textvariable=self.event_filter_var,
+                                                state="readonly", values=[EVENT_FILTER_ALL], width=20)
+        self.event_filter_combo.pack(side="left")
+        self.event_filter_combo.bind("<<ComboboxSelected>>", lambda e: self._on_event_filter_change())
+        self._event_filter_label_to_key = {}
+
         self.category_scroll = HorizontalScrollFrame(self.category_bar_wrap)
         self.category_scroll.pack(fill="x")
 
@@ -1999,6 +2016,32 @@ class BazaarFlipperApp(tk.Tk):
         add_pill.pack(side="left", padx=(8, 4), pady=4)
         add_pill.bind("<Button-1>", lambda e: self.open_add_category())
         hoverable(add_pill, BG_DARK, ACCENT_SOFT, fg=ACCENT, hover_fg=ACCENT_HOVER)
+
+    def _rebuild_event_filter_options(self):
+        """Rebuilds the Event filter dropdown's options from whatever
+        event_tags actually appear in the current flip data, so it only
+        ever offers events with at least one matching item. If the
+        previously-selected event no longer has any matches (e.g. after
+        a refresh), falls back to "All Events" rather than silently
+        filtering to nothing."""
+        keys_present = set()
+        for f in self.all_flips:
+            keys_present.update(f.get("event_tags", []))
+
+        label_to_key = {}
+        for key in keys_present:
+            label, _color = EVENT_BADGE_STYLE.get(key, (key, ACCENT))
+            label_to_key[label] = key
+        self._event_filter_label_to_key = label_to_key
+
+        options = [EVENT_FILTER_ALL] + sorted(label_to_key)
+        self.event_filter_combo.configure(values=options)
+        if self.event_filter_var.get() not in options:
+            self.event_filter_var.set(EVENT_FILTER_ALL)
+
+    def _on_event_filter_change(self):
+        self._full_list_shown = self._full_list_page_size
+        self.recompute_and_render()
 
     def select_category(self, cat):
         self.category_var.set(cat)
@@ -2399,6 +2442,7 @@ class BazaarFlipperApp(tk.Tk):
         self._tick_snapshot_age()
 
         self._rebuild_category_bar()
+        self._rebuild_event_filter_options()
         self._full_list_shown = self._full_list_page_size
         self.recompute_and_render()
 
@@ -2469,6 +2513,12 @@ class BazaarFlipperApp(tk.Tk):
             selected = self.category_var.get()
             if selected not in (ALL_CATEGORIES, "", None):
                 flips = [f for f in flips if f["category"] == selected]
+
+            selected_event_label = self.event_filter_var.get()
+            if selected_event_label != EVENT_FILTER_ALL:
+                event_key = self._event_filter_label_to_key.get(selected_event_label)
+                if event_key:
+                    flips = [f for f in flips if event_key in f.get("event_tags", [])]
 
         query = self.search_var.get().strip().lower()
         if query:
