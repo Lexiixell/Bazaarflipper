@@ -371,16 +371,17 @@ def paul_dungeon_discount_active(info):
 # something unrelated that happens to share a word (acceptable for an
 # informational badge, not something the profit math depends on).
 EVENT_ITEM_KEYWORDS = {
-    "mining_fiesta": ["REFINED_MINERAL", "GLOSSY_GEMSTONE", "MINERAL", "GEMSTONE",
-                       "MITHRIL_ORE", "TITANIUM_ORE"],
-    "fishing_festival": ["SHARK", "PRISMARINE", "MAGMA_FISH"],
-    "mythological_ritual": ["GRIFFIN", "ANCIENT_CLAW", "MYTHOLOGICAL", "PANDORA",
-                             "DAEDALUS", "MEDUSA", "TITAN", "SIREN", "MINOS"],
-    "jerry_workshop": ["GIFT", "NORTH_STAR", "SNOW", "ICE_", "JERRY", "GINGERBREAD",
-                        "CANDY_CANE", "FROZEN", "WALNUT", "STOCKING"],
-    "spooky_festival": ["CANDY_CORN", "MUTANT_ENDERMAN"],
-    "dungeon_supply": ["ESSENCE_", "RECOMBOBULATOR", "FUMING_POTATO_BOOK", "SHADOW_FURY",
-                        "NECRON", "SCYLLA", "STORM_", "GOLDOR", "MAXOR"],
+    "mining_fiesta": ["REFINED_MINERAL", "GLOSSY_GEMSTONE"],
+    "fishing_festival": ["SHARK"],
+    "mythological_ritual": ["ANCIENT_CLAW", "MINOS", "HARPY", "DAEDALUS", "MINOAUR", "CREATAN_BULL", "SPHINX" "ENCHANTMENT_ULTIMATE_CHIMERA"],
+    "jerry_workshop": ["GIFT", "HUNK_OF_BLUE_ICE", "HUNK_OF_ICE", "ENCHANTMENT_PROSPERITY", "WALNUT",],
+    "spooky_festival": ["CANDY_CORN", "PURPLE_CANDY", "GREEN_CANDY",
+                         "ECTOPLASM", "PUMPKING_GUTS", "SPOOKY_FRAGMENT", "WEREWOLF_SKIN",
+                         "SOUL_FRAGMENT"],
+    "dungeon_supply": ["ESSENCE_UNDEAD", "ESSENCE_WITHER", "RECOMBOBULATOR",
+                        "FUMING_POTATO_BOOK", "HOT_POTATO_BOOK", "PRECURSOR_GEAR",
+                        "IMPLOSION_SCROLL", "SHADOW_WARP_SCROLL", "WITHER_SHIELD_SCROLL"
+                        "MASTER_STAR"],
 }
 
 
