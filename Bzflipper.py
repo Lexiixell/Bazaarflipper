@@ -846,7 +846,21 @@ def check_for_update():
     data = response.json()
     latest_tag = data.get("tag_name", "")
     release_url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
+    
+    # --- START OF DEBUG LOGS ---
+    print("\n" + "="*40)
+    print("      UPDATER DEBUG LOGS      ")
+    print("="*40)
+    print(f"[VERSION CHECK]")
+    print(f"  -> Local version string (APP_VERSION): '{APP_VERSION}'")
+    print(f"  -> Local version parsed tuple:         {_parse_version(APP_VERSION)}")
+    print(f"  -> GitHub latest tag found:            '{latest_tag}'")
+    print(f"  -> GitHub tag parsed tuple:            {_parse_version(latest_tag)}")
+    
     update_available = _parse_version(latest_tag) > _parse_version(APP_VERSION)
+    print(f"  -> Does Remote > Local? Result:        {update_available}")
+    print("\n[GITHUB ASSETS FOUND]")
+    # --- END OF DEBUG LOGS ---
 
     # NOTE: data.get("assets", []) is the list of files YOU manually attach
     # to the release (uploaded_download_url etc.) - it does NOT include
@@ -855,11 +869,24 @@ def check_for_update():
     # not in "assets". So this only ever matches a zip you actually uploaded.
     asset_url = None
     for asset in data.get("assets", []):
-        if asset.get("name", "").lower().endswith(".zip"):
+        asset_name = asset.get("name", "")
+        # --- DEBUG LINE FOR ASSETS ---
+        print(f"  -> Found file: '{asset_name}'")
+        
+        if asset_name.lower().endswith(".zip") or asset_name.lower().endswith(".rar"):
             asset_url = asset.get("browser_download_url")
+            # --- DEBUG LINE FOR MATCH ---
+            print(f"     MATCHED ASSET! URL: {asset_url}")
             break
 
+    # --- FINAL DEBUG PRINT ---
+    if not asset_url:
+        print("  -> WARNING: No matching .zip or .rar asset was selected!")
+    print("="*40 + "\n")
+    # --------------------------
+
     return update_available, latest_tag, release_url, asset_url
+
 
 
 def fetch_item_categories():
@@ -2598,6 +2625,8 @@ class BazaarFlipperApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh()
         self._schedule_auto_refresh()
+        self._check_previous_update_failure()
+        self._check_previous_update_failure()
         self._check_for_update_async(silent=True)
 
     # -- setup ----------------------------------------------------------
@@ -2948,6 +2977,25 @@ class BazaarFlipperApp(tk.Tk):
         self.refresh()
         self._schedule_auto_refresh()
 
+    def _check_previous_update_failure(self):
+        """If the last self-update attempt failed, the batch script leaves a
+        log behind in the scratch folder - surface it once, then clean it up
+        so it doesn't reappear on every future launch."""
+        work_dir = os.path.join(tempfile.gettempdir(), "BazaarFlipperUpdate")
+        log_path = os.path.join(work_dir, "update_failed.log")
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    message = f.read().strip()
+            except OSError:
+                message = "Unknown error (couldn't read log)."
+            messagebox.showerror(
+                "Update Failed",
+                f"The last update attempt failed:\n\n{message}\n\n"
+                f"The app has continued running your previous version. "
+                f"Try 'Check for Updates' again, or update manually from GitHub.")
+            shutil.rmtree(work_dir, ignore_errors=True)
+
     # -- update checker -------------------------------------------------
     def _check_for_update_async(self, silent=False):
         """Hits GitHub in a background thread (same pattern as the bazaar
@@ -3113,19 +3161,26 @@ class BazaarFlipperApp(tk.Tk):
 
         bat_contents = [
             "@echo off\r\n",
+            f'echo Starting update process... > "{work_dir}\\bat_debug.log"\r\n',
             ":wait\r\n",
-            f'tasklist /fi "imagename eq {exe_name}" | find /i "{exe_name}" >nul\r\n',
+            f'tasklist /fi "imagename eq {exe_name}" 2>nul | find /i "{exe_name}" >nul 2>&1\r\n',
             "if not errorlevel 1 (\r\n",
-            "    timeout /t 1 /nobreak >nul\r\n",
+            "    timeout /t 1 /nobreak >nul 2>&1\r\n",
             "    goto wait\r\n",
             ")\r\n",
-            "timeout /t 2 /nobreak >nul\r\n",
-            f'robocopy "{source_dir}" "{exe_dir}" /E /MIR /R:3 /W:1 >nul\r\n',
-            "timeout /t 3 /nobreak >nul\r\n",
+            f'echo Process exited, waiting 2s... >> "{work_dir}\\bat_debug.log"\r\n',
+            "timeout /t 2 /nobreak >nul 2>&1\r\n",
+            f'echo Running robocopy from "{source_dir}" to "{exe_dir}"... >> "{work_dir}\\bat_debug.log"\r\n',
+            f'robocopy "{source_dir}" "{exe_dir}" /E /MIR /R:3 /W:1 >> "{work_dir}\\bat_debug.log" 2>&1\r\n',
+            f'echo Robocopy exit code: %errorlevel% >> "{work_dir}\\bat_debug.log"\r\n',
+            "if %errorlevel% geq 8 (\r\n",
+            f'    echo Update failed - robocopy error %errorlevel% > "{work_dir}\\update_failed.log"\r\n',
+            "    exit /b 1\r\n",
+            ")\r\n",
+            f'echo Starting new exe... >> "{work_dir}\\bat_debug.log"\r\n',
+            "timeout /t 3 /nobreak >nul 2>&1\r\n",
             f'start "" "{current_exe}"\r\n',
-            f'rmdir /s /q "{work_dir}"\r\n',
-            'del "%~f0"\r\n',
-        ]
+]
 
         with open(bat_path, "w") as f:
             f.writelines(bat_contents)
