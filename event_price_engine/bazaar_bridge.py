@@ -12,7 +12,7 @@ after self.price_history is updated) and it will:
      backfill.
   2. Keep item_event_map in sync with bazaarflipper's own
      EVENT_ITEM_KEYWORDS / tag_event_relevance().
-  3. Ingest bazaarflipper's price_history.json into the SQLite store via
+  3. Ingest bazaarflipper's price_history.json into the DuckDB store via
      Database.import_price_history_json (idempotent, cheap to call every
      tick).
 """
@@ -23,7 +23,8 @@ from typing import Optional
 from event_price_engine import Database
 
 
-DB_FILENAME = "event_price_history.sqlite"
+DB_FILENAME = "event_price_history.duckdb"
+LEGACY_SQLITE_FILENAME = "event_price_history.sqlite"
 
 # All event keys the bridge tracks as concrete event instances (with
 # start/end timestamps). "dungeon_supply" is deliberately excluded --
@@ -164,7 +165,22 @@ def bridge_tick(app, db_dir: Optional[str] = None):
     db = getattr(app, "_event_price_db", None)
     state = getattr(app, "_event_price_bridge_state", None)
     if db is None:
+        legacy_path = os.path.join(db_dir, LEGACY_SQLITE_FILENAME)
+        needs_migration = not os.path.exists(db_path) and os.path.exists(legacy_path)
+
         db = Database(db_path)
+        if needs_migration:
+            # One-time carryover from the old SQLite store into the fresh
+            # DuckDB one -- see db.migrate_from_sqlite. Best-effort: if it
+            # fails (e.g. no network for the sqlite_scanner extension on
+            # first use), the app just proceeds with an empty DuckDB store
+            # rather than blocking startup on it.
+            try:
+                from . import db as _db
+                _db.migrate_from_sqlite(db.conn, legacy_path)
+            except Exception:
+                import traceback
+                traceback.print_exc()
         state = BridgeState(db)
         app._event_price_db = db
         app._event_price_bridge_state = state

@@ -1,5 +1,5 @@
 """
-db.py -- SQLite schema + data-access layer for the event price engine.
+db.py -- DuckDB schema + data-access layer for the event price engine.
 
 Schema
 ------
@@ -26,18 +26,18 @@ recommendations_log(...)
 
 import gzip
 import json
-import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Optional
 
+import duckdb
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS price_history (
     item_id   TEXT    NOT NULL,
     ts        INTEGER NOT NULL,
-    price     REAL    NOT NULL,
-    volume    REAL    DEFAULT 0,
+    price     DOUBLE  NOT NULL,
+    volume    DOUBLE  DEFAULT 0,
     PRIMARY KEY (item_id, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_price_item_ts ON price_history(item_id, ts);
@@ -56,19 +56,22 @@ CREATE TABLE IF NOT EXISTS item_event_map (
     PRIMARY KEY (item_id, event_type)
 );
 
+-- DuckDB has no AUTOINCREMENT keyword; a sequence + DEFAULT nextval(...)
+-- is the equivalent for recommendations_log.id.
+CREATE SEQUENCE IF NOT EXISTS seq_recommendations_log_id START 1;
 CREATE TABLE IF NOT EXISTS recommendations_log (
-    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                    INTEGER PRIMARY KEY DEFAULT nextval('seq_recommendations_log_id'),
     item_id               TEXT NOT NULL,
     event_type            TEXT NOT NULL,
     event_instance_id     TEXT NOT NULL,
     generated_ts          INTEGER NOT NULL,
     action                TEXT NOT NULL,
-    buy_confidence        REAL,
-    sell_confidence       REAL,
-    expected_appreciation REAL,
-    expected_holding_days REAL,
+    buy_confidence        DOUBLE,
+    sell_confidence       DOUBLE,
+    expected_appreciation DOUBLE,
+    expected_holding_days DOUBLE,
     details_json          TEXT,
-    outcome_price_at_eval REAL,
+    outcome_price_at_eval DOUBLE,
     outcome_recorded_ts   INTEGER
 );
 
@@ -76,7 +79,7 @@ CREATE TABLE IF NOT EXISTS recommendations_log (
 -- doesn't re-read/re-insert samples already stored (idempotent ingest).
 CREATE TABLE IF NOT EXISTS ingest_state (
     source_path      TEXT PRIMARY KEY,
-    last_mtime       REAL,
+    last_mtime       DOUBLE,
     last_ts_by_item  TEXT
 );
 
@@ -109,8 +112,9 @@ CREATE TABLE IF NOT EXISTS event_forecast (
 -- closed out to a reasonable end time on the next boot, instead of either
 -- staying "open" forever or being guessed as ending exactly at the next
 -- boot.
+CREATE SEQUENCE IF NOT EXISTS seq_app_sessions_id START 1;
 CREATE TABLE IF NOT EXISTS app_sessions (
-    session_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id        INTEGER PRIMARY KEY DEFAULT nextval('seq_app_sessions_id'),
     start_ts          INTEGER NOT NULL,
     end_ts            INTEGER,
     last_heartbeat_ts INTEGER NOT NULL
@@ -158,33 +162,66 @@ class Session:
     last_heartbeat_ts: int
 
 
-def connect(db_path: str) -> sqlite3.Connection:
-    """Opens the SQLite DB with compression-friendly pragmas. SQLite's own
-    file format isn't compressed on disk, so 'compressed' here is achieved
-    by (a) storing normalized numeric rows instead of repeating JSON keys
-    per sample -- which is already a large size reduction vs. price_history.json
-    -- and (b) running VACUUM periodically (see vacuum()) plus WAL+auto_vacuum
-    so the file doesn't bloat with dead pages as old samples get pruned."""
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA auto_vacuum=INCREMENTAL;")
-    conn.executescript(SCHEMA)
+def connect(db_path: str) -> duckdb.DuckDBPyConnection:
+    """Opens the DuckDB store. DuckDB is columnar with built-in compression,
+    so numeric time-series data like price_history is compact on disk
+    without any of SQLite's manual auto_vacuum/incremental_vacuum dance --
+    see vacuum() for the DuckDB equivalent (VACUUM + CHECKPOINT)."""
+    conn = duckdb.connect(db_path)
+    conn.execute(SCHEMA)
     conn.commit()
     return conn
 
 
-def vacuum(conn: sqlite3.Connection):
-    """Reclaims space freed by pruning old price_history rows. Cheap to
-    call periodically (e.g. once per day from bazaarflipper's refresh
-    loop) since auto_vacuum=INCREMENTAL makes each call only do the work
-    accumulated since the last one."""
-    conn.execute("PRAGMA incremental_vacuum;")
+def vacuum(conn: duckdb.DuckDBPyConnection):
+    """Reclaims space freed by pruning old price_history rows and flushes
+    the WAL into the main file. Cheap to call periodically (e.g. once a
+    day from bazaarflipper's refresh loop)."""
+    conn.execute("VACUUM;")
+    conn.execute("CHECKPOINT;")
     conn.commit()
+
+
+def migrate_from_sqlite(conn: duckdb.DuckDBPyConnection, sqlite_path: str) -> bool:
+    """One-time best-effort import of a legacy event_price_history.sqlite
+    into this (freshly-created, schema-only) DuckDB connection, via
+    DuckDB's sqlite_scanner extension. Table-by-table and each wrapped in
+    its own try/except so an older sqlite file missing a table (e.g. one
+    written before event_forecast/app_sessions existed) still lets every
+    other table migrate -- fails open, same philosophy as the rest of this
+    module, rather than aborting the whole migration over one table.
+    Returns True if the extension+attach step itself succeeded (regardless
+    of how many tables had data to copy), False if sqlite_scanner isn't
+    available (e.g. offline first run) and the caller should just proceed
+    with an empty DuckDB store."""
+    try:
+        conn.execute("INSTALL sqlite;")
+        conn.execute("LOAD sqlite;")
+        # ATTACH doesn't accept bound parameters for the path (it's parsed
+        # like a DDL literal, not a query argument) -- escape and inline it.
+        escaped_path = sqlite_path.replace("'", "''")
+        conn.execute(f"ATTACH '{escaped_path}' AS legacy (TYPE sqlite);")
+    except Exception:
+        return False
+
+    for table in ("price_history", "events", "item_event_map", "recommendations_log",
+                  "ingest_state", "event_forecast", "app_sessions"):
+        try:
+            conn.execute(f"INSERT OR IGNORE INTO {table} SELECT * FROM legacy.{table};")
+        except Exception:
+            continue
+
+    try:
+        conn.execute("DETACH legacy;")
+    except Exception:
+        pass
+    conn.commit()
+    return True
 
 
 # ---- loaders --------------------------------------------------------------
 
-def load_price_history(conn: sqlite3.Connection, item_id: str,
+def load_price_history(conn: duckdb.DuckDBPyConnection, item_id: str,
                         start_ts: Optional[int] = None,
                         end_ts: Optional[int] = None) -> list:
     q = "SELECT ts, price, volume FROM price_history WHERE item_id = ?"
@@ -200,7 +237,7 @@ def load_price_history(conn: sqlite3.Connection, item_id: str,
     return [PricePoint(ts=r[0], price=r[1], volume=r[2] or 0.0) for r in rows]
 
 
-def load_event_instances(conn: sqlite3.Connection, event_type: str,
+def load_event_instances(conn: duckdb.DuckDBPyConnection, event_type: str,
                           before_ts: Optional[int] = None) -> list:
     q = "SELECT event_instance_id, event_type, start_ts, end_ts FROM events WHERE event_type = ?"
     params = [event_type]
@@ -212,7 +249,7 @@ def load_event_instances(conn: sqlite3.Connection, event_type: str,
     return [EventInstance(*r) for r in rows]
 
 
-def load_upcoming_events(conn: sqlite3.Connection, after_ts: Optional[int] = None) -> list:
+def load_upcoming_events(conn: duckdb.DuckDBPyConnection, after_ts: Optional[int] = None) -> list:
     after_ts = after_ts if after_ts is not None else int(time.time())
     rows = conn.execute(
         "SELECT event_instance_id, event_type, start_ts, end_ts FROM events "
@@ -221,7 +258,7 @@ def load_upcoming_events(conn: sqlite3.Connection, after_ts: Optional[int] = Non
     return [EventInstance(*r) for r in rows]
 
 
-def load_items_for_event_type(conn: sqlite3.Connection, event_type: str) -> list:
+def load_items_for_event_type(conn: duckdb.DuckDBPyConnection, event_type: str) -> list:
     rows = conn.execute(
         "SELECT item_id FROM item_event_map WHERE event_type = ?", (event_type,)
     ).fetchall()
@@ -230,7 +267,7 @@ def load_items_for_event_type(conn: sqlite3.Connection, event_type: str) -> list
 
 # ---- writers ---------------------------------------------------------------
 
-def upsert_item_event_map(conn: sqlite3.Connection, item_id: str, event_type: str):
+def upsert_item_event_map(conn: duckdb.DuckDBPyConnection, item_id: str, event_type: str):
     conn.execute(
         "INSERT OR IGNORE INTO item_event_map (item_id, event_type) VALUES (?, ?)",
         (item_id, event_type)
@@ -238,7 +275,7 @@ def upsert_item_event_map(conn: sqlite3.Connection, item_id: str, event_type: st
     conn.commit()
 
 
-def upsert_event_instance(conn: sqlite3.Connection, event_instance_id: str,
+def upsert_event_instance(conn: duckdb.DuckDBPyConnection, event_instance_id: str,
                            event_type: str, start_ts: int, end_ts: Optional[int] = None):
     """Insert a new event occurrence, or update its end_ts once it closes.
     This is the real-time replacement for a synthetic backfill: called by
@@ -254,7 +291,7 @@ def upsert_event_instance(conn: sqlite3.Connection, event_instance_id: str,
     conn.commit()
 
 
-def upsert_event_forecast(conn: sqlite3.Connection, event_type: str, next_start_ts: int,
+def upsert_event_forecast(conn: duckdb.DuckDBPyConnection, event_type: str, next_start_ts: int,
                            computed_ts: int, within_lead: bool = False,
                            source: Optional[str] = None):
     """Record (or refresh) the predicted next start of an event type. Called
@@ -274,7 +311,7 @@ def upsert_event_forecast(conn: sqlite3.Connection, event_type: str, next_start_
     conn.commit()
 
 
-def load_event_forecasts(conn: sqlite3.Connection, within_lead_only: bool = False) -> list:
+def load_event_forecasts(conn: duckdb.DuckDBPyConnection, within_lead_only: bool = False) -> list:
     q = "SELECT event_type, next_start_ts, computed_ts, within_lead, source FROM event_forecast"
     if within_lead_only:
         q += " WHERE within_lead = 1"
@@ -284,7 +321,7 @@ def load_event_forecasts(conn: sqlite3.Connection, within_lead_only: bool = Fals
                           within_lead=bool(r[3]), source=r[4]) for r in rows]
 
 
-def load_event_forecast(conn: sqlite3.Connection, event_type: str) -> Optional[EventForecast]:
+def load_event_forecast(conn: duckdb.DuckDBPyConnection, event_type: str) -> Optional[EventForecast]:
     row = conn.execute(
         "SELECT event_type, next_start_ts, computed_ts, within_lead, source "
         "FROM event_forecast WHERE event_type = ?", (event_type,)
@@ -295,7 +332,7 @@ def load_event_forecast(conn: sqlite3.Connection, event_type: str) -> Optional[E
                          within_lead=bool(row[3]), source=row[4])
 
 
-def close_stale_sessions(conn: sqlite3.Connection, fallback_end_ts: Optional[int] = None):
+def close_stale_sessions(conn: duckdb.DuckDBPyConnection, fallback_end_ts: Optional[int] = None):
     """Closes out any session left with end_ts IS NULL -- i.e. the app didn't
     reach bridge_close last run (crash, force-quit, power loss). Each is
     closed at ITS OWN last_heartbeat_ts, not `now` or a shared fallback --
@@ -312,16 +349,19 @@ def close_stale_sessions(conn: sqlite3.Connection, fallback_end_ts: Optional[int
     conn.commit()
 
 
-def start_session(conn: sqlite3.Connection, start_ts: int) -> int:
-    cur = conn.execute(
-        "INSERT INTO app_sessions (start_ts, end_ts, last_heartbeat_ts) VALUES (?, NULL, ?)",
+def start_session(conn: duckdb.DuckDBPyConnection, start_ts: int) -> int:
+    # DuckDB has no cursor.lastrowid; RETURNING the generated id is the
+    # equivalent way to learn the new session_id.
+    row = conn.execute(
+        "INSERT INTO app_sessions (start_ts, end_ts, last_heartbeat_ts) VALUES (?, NULL, ?) "
+        "RETURNING session_id",
         (start_ts, start_ts)
-    )
+    ).fetchone()
     conn.commit()
-    return cur.lastrowid
+    return row[0]
 
 
-def heartbeat_session(conn: sqlite3.Connection, session_id: int, ts: int):
+def heartbeat_session(conn: duckdb.DuckDBPyConnection, session_id: int, ts: int):
     conn.execute(
         "UPDATE app_sessions SET last_heartbeat_ts = ? WHERE session_id = ? AND end_ts IS NULL",
         (ts, session_id)
@@ -329,7 +369,7 @@ def heartbeat_session(conn: sqlite3.Connection, session_id: int, ts: int):
     conn.commit()
 
 
-def close_session(conn: sqlite3.Connection, session_id: int, end_ts: int):
+def close_session(conn: duckdb.DuckDBPyConnection, session_id: int, end_ts: int):
     conn.execute(
         "UPDATE app_sessions SET end_ts = ?, last_heartbeat_ts = ? WHERE session_id = ?",
         (end_ts, end_ts, session_id)
@@ -337,7 +377,7 @@ def close_session(conn: sqlite3.Connection, session_id: int, end_ts: int):
     conn.commit()
 
 
-def load_sessions(conn: sqlite3.Connection, after_ts: Optional[int] = None) -> list:
+def load_sessions(conn: duckdb.DuckDBPyConnection, after_ts: Optional[int] = None) -> list:
     q = "SELECT session_id, start_ts, end_ts, last_heartbeat_ts FROM app_sessions"
     params = []
     if after_ts is not None:
@@ -348,7 +388,7 @@ def load_sessions(conn: sqlite3.Connection, after_ts: Optional[int] = None) -> l
     return [Session(*r) for r in rows]
 
 
-def session_coverage(conn: sqlite3.Connection, start_ts: int, end_ts: int) -> float:
+def session_coverage(conn: duckdb.DuckDBPyConnection, start_ts: int, end_ts: int) -> float:
     """Fraction (0..1) of the [start_ts, end_ts) window during which an app
     session was open -- i.e. how much of that window was actually spent
     watching/sampling live prices, as opposed to closed. A still-open
@@ -394,22 +434,25 @@ def session_coverage(conn: sqlite3.Connection, start_ts: int, end_ts: int) -> fl
     return max(0.0, min(1.0, covered / (end_ts - start_ts)))
 
 
-def log_recommendation(conn: sqlite3.Connection, rec: dict) -> int:
-    cur = conn.execute(
+def log_recommendation(conn: duckdb.DuckDBPyConnection, rec: dict) -> int:
+    # DuckDB has no cursor.lastrowid; RETURNING the generated id is the
+    # equivalent way to learn the new recommendations_log.id.
+    row = conn.execute(
         "INSERT INTO recommendations_log "
         "(item_id, event_type, event_instance_id, generated_ts, action, "
         " buy_confidence, sell_confidence, expected_appreciation, "
-        " expected_holding_days, details_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        " expected_holding_days, details_json) VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "RETURNING id",
         (rec["item_id"], rec["event_type"], rec["event_instance_id"],
          rec["generated_ts"], rec["action"], rec["buy_confidence"],
          rec["sell_confidence"], rec["expected_appreciation"],
          rec["expected_holding_days"], rec["details_json"])
-    )
+    ).fetchone()
     conn.commit()
-    return cur.lastrowid
+    return row[0]
 
 
-def record_outcome(conn: sqlite3.Connection, recommendation_id: int, price_at_eval: float):
+def record_outcome(conn: duckdb.DuckDBPyConnection, recommendation_id: int, price_at_eval: float):
     conn.execute(
         "UPDATE recommendations_log SET outcome_price_at_eval = ?, outcome_recorded_ts = ? "
         "WHERE id = ?",
@@ -426,7 +469,7 @@ def record_outcome(conn: sqlite3.Connection, recommendation_id: int, price_at_ev
 # the single long-running store, since price_history.json itself only
 # ever holds ~7 days at a time and gets pruned/overwritten on every refresh.
 
-def import_price_history_json(conn: sqlite3.Connection, json_path: str) -> int:
+def import_price_history_json(conn: duckdb.DuckDBPyConnection, json_path: str) -> int:
     """Reads bazaarflipper's price_history.json (shape:
     {product_id: [[ts, raw_buy_target, raw_sell_target], ...]}) and
     inserts any samples not already present. Idempotent and safe to call
@@ -462,22 +505,31 @@ def import_price_history_json(conn: sqlite3.Connection, json_path: str) -> int:
             rows.append((product_id, ts, price, 0.0))
         if not rows:
             continue
-        cur = conn.executemany(
-            "INSERT OR IGNORE INTO price_history (item_id, ts, price, volume) VALUES (?,?,?,?)",
-            rows
-        )
-        inserted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        # DuckDB's executemany() doesn't report affected-row counts (always
+        # -1), unlike sqlite3's cursor.rowcount. A single multi-row INSERT
+        # with RETURNING is used instead: ON CONFLICT DO NOTHING only
+        # returns the rows actually inserted, so counting them gives an
+        # exact new-row count.
+        placeholders = ",".join(["(?,?,?,?)"] * len(rows))
+        params = [v for row in rows for v in row]
+        new_rows = conn.execute(
+            f"INSERT OR IGNORE INTO price_history (item_id, ts, price, volume) VALUES {placeholders} "
+            "RETURNING item_id",
+            params
+        ).fetchall()
+        inserted += len(new_rows)
 
     conn.commit()
     return inserted
 
 
-def export_price_history_gz(conn: sqlite3.Connection, out_path: str,
+def export_price_history_gz(conn: duckdb.DuckDBPyConnection, out_path: str,
                              item_id: Optional[str] = None):
     """Writes a gzip-compressed JSON snapshot of price_history -- useful
-    for backups or sharing a compact copy, separate from the live .sqlite
-    file itself (which is already the primary compressed-relative-to-JSON
-    store; see connect()'s docstring). Filters to one item if given."""
+    for backups or sharing a compact copy, separate from the live .duckdb
+    file itself (which is already compact -- DuckDB is columnar with
+    built-in compression; see connect()'s docstring). Filters to one item
+    if given."""
     q = "SELECT item_id, ts, price, volume FROM price_history"
     params = []
     if item_id is not None:

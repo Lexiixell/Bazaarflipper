@@ -3,10 +3,11 @@ scoring.py -- combination layer + confidence scoring.
 """
 
 import json
-import sqlite3
 import time
 from dataclasses import dataclass, asdict
 from typing import Optional
+
+import duckdb
 
 from .indicators import IndicatorContext, DEFAULT_INDICATORS, days_to_peak_estimate
 
@@ -102,7 +103,7 @@ def score_recommendation(item_id: str, event_type: str, event_instance_id: str,
     )
 
 
-def historical_accuracy_for_event_type(conn: sqlite3.Connection, event_type: str,
+def historical_accuracy_for_event_type(conn: duckdb.DuckDBPyConnection, event_type: str,
                                          tolerance_pct: float = 3.0) -> Optional[float]:
     rows = conn.execute(
         "SELECT action, expected_appreciation, outcome_price_at_eval, "
