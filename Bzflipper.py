@@ -143,6 +143,14 @@ DEFAULT_PLAN_MIN_DAILY_VOLUME = MIN_DAILY_COIN_VOLUME * 4  # the Overnight Plan
     # list (which only needs to clear MIN_DAILY_COIN_VOLUME to show up at
     # all) - thin-but-technically-alive items are exactly the ones most
     # likely to stall out or get manipulated while you're asleep.
+DEFAULT_MIN_WEEKLY_SALES = 10_000  # floor on UNITS, not coins - daily_coin_volume
+    # blends buy-side and sell-side moving-week volume together, so an item
+    # with heavy buy-order traffic but a thin trickle of actual sales can
+    # still clear the coin-volume floor above while being genuinely slow to
+    # offload. This floor is checked against weekly_volume, which is
+    # already the thinner (bottleneck) side of buyMovingWeek/sellMovingWeek
+    # - so it catches exactly the "great margin, nobody's actually trading
+    # it" items the coin-volume floor alone lets through.
 
 # ---- Skyblock calendar --------------------------------------------------
 # Hypixel exposes no "current skyblock date" API field - the calendar is
@@ -387,12 +395,12 @@ ORINGO_LEGENDARY_ROTATION = [
 # Bazaar materials associated with each legendary pet (items whose demand
 # shifts when that pet is available from Oringo). Indexed by pet name.
 ORINGO_PET_MATERIALS = {
-    "Blue Whale": ["ENCHANTED_RAW_FISH", "ENCHANTED_INK_SAC", "ENCHANTED_PRISMARINE_SHARD"],
-    "Tiger":      ["ENCHANTED_RAW_BEEF", "ENCHANTED_BLAZE_ROD"],
-    "Lion":       ["ENCHANTED_GOLD_BLOCK", "ENCHANTED_GRILLED_PORK"],
-    "Monkey":     ["ENCHANTED_JUNGLE_LOG", "ENCHANTED_COOKIE"],
-    "Elephant":   ["ENCHANTED_IRON_BLOCK", "ENCHANTED_HAY_BALE"],
-    "Giraffe":    ["ENCHANTED_ACACIA_LOG", "ENCHANTED_CACTUS"],
+    "Blue Whale": ["ENCHANTED_COOKED_FISH"],
+    "Tiger":      ["ENCHANTED_RAW_CHICKEN"],
+    "Lion":       ["ENCHANTED_RAW_BEEF"],
+    "Monkey":     ["ENCHANTED_JUNGLE_LOG"],
+    "Elephant":   ["ENCHANTED_DARK_OAK_LOG"],
+    "Giraffe":    ["ENCHANTED_ACACIA_LOG"],
 }
 
 # ---- Year of the Pig ------------------------------------------------
@@ -517,18 +525,18 @@ EVENT_ITEM_KEYWORDS = {
     "dungeon_supply": ["ESSENCE_UNDEAD", "ESSENCE_WITHER", "RECOMBOBULATOR",
                         "FUMING_POTATO_BOOK", "HOT_POTATO_BOOK", "PRECURSOR_GEAR",
                         "IMPLOSION_SCROLL", "SHADOW_WARP_SCROLL", "WITHER_SHIELD_SCROLL"
-                        "FIRST_MASTER_STAR","SECOND_MASTER_STAR","THIRD_MASTER_STAR","FOURTH_MASTER_STAR","FIFTH_MASTER_STAR",],
+                        "FIRST_MASTER_STAR","SECOND_MASTER_STAR","THIRD_MASTER_STAR","FOURTH_MASTER_STAR","FIFTH_MASTER_STAR","WITHERBLOOD"],
     "harvest_festival": ["CORNUCOPIA", "CARROT_ZEST", "DEEPFRIES", "AGGOURDIAN",
                           "CANE_KNOT", "MELON_JUICE", "CACTUS_FLOWER",
                           "DESIGNER_COFFEE_BEANS", "FEASTFUNGUS", "BOTROOT",
                           "SALTED_SUNFLOWER_SEEDS", "CRYSTALIZED_MOONLIGHT",
                           "FLORAL_GELATIN"],
-    "oringo": ["ENCHANTED_RAW_FISH", "ENCHANTED_INK_SAC", "ENCHANTED_PRISMARINE_SHARD",
-                "ENCHANTED_RAW_BEEF", "ENCHANTED_BLAZE_ROD",
-                "ENCHANTED_GOLD_BLOCK", "ENCHANTED_GRILLED_PORK",
-                "ENCHANTED_JUNGLE_LOG", "ENCHANTED_COOKIE",
-                "ENCHANTED_IRON_BLOCK", "ENCHANTED_HAY_BALE",
-                "ENCHANTED_ACACIA_LOG", "ENCHANTED_CACTUS"],
+    "oringo": ["ENCHANTED_COOKED_FISH", 
+                "ENCHANTED_RAW_BEEF", 
+                "ENCHANTED_RAW_CHICKEN",
+                "ENCHANTED_JUNGLE_LOG", 
+                "ENCHANTED_DARK_OAK_LOG", 
+                "ENCHANTED_ACACIA_LOG",],
     "year_of_pig": ["FARMING_FOR_DUMMIES", "ENCHANTMENT_HARVESTING",
                      "POTATO_SPREADING"],
 }
@@ -1117,12 +1125,12 @@ def compute_purse_metrics(flips, purse):
     return flips
 
 
-def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume):
+def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume, min_weekly_volume=0):
     """Spread `purse` across up to `target_n` of the best flips, sized so
     each item's slice is realistically fillable within `sleep_hours` -
     instead of one all-in pick.
 
-    Three risk filters get applied before anything is ranked, since this
+    Four risk filters get applied before anything is ranked, since this
     plan runs unattended while you're away:
       - extreme-margin items are dropped entirely. A margin that wide is
         as likely to be a stale/manipulated order book as a real
@@ -1138,6 +1146,13 @@ def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume
         (they already cleared the global dead-item filter) but thin
         enough that one unlucky order can leave you sitting on unsold
         stock all night.
+      - items whose trailing-week UNIT sales (weekly_volume - already the
+        thinner of buyMovingWeek/sellMovingWeek) are below
+        `min_weekly_volume` are dropped. daily_coin_volume above blends
+        both sides together, so a coin-heavy but rarely-traded item can
+        still clear that floor while actually being slow to fill or
+        offload - this catches those directly, on units rather than
+        coins.
 
     What's left is ranked by profit potential WITHIN the sleep window
     itself (liquidity_units_over_horizon * profit), not by an
@@ -1155,6 +1170,7 @@ def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume
     sleep_hours = max(0.1, sleep_hours)
     target_n = max(1, int(target_n))
     min_daily_coin_volume = max(0, min_daily_coin_volume)
+    min_weekly_volume = max(0, min_weekly_volume)
 
     base_pool = [f for f in flips if f.get("cost_per_item", 0) > 0 and f.get("hourly_volume", 0) > 0]
     candidates = [
@@ -1162,6 +1178,7 @@ def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume
         if not f.get("extreme_margin")
         and not f.get("price_manipulation_suspect")
         and f.get("daily_coin_volume", 0) >= min_daily_coin_volume
+        and f.get("weekly_volume", 0) >= min_weekly_volume
     ]
     risk_excluded_count = len(base_pool) - len(candidates)
 
@@ -1699,35 +1716,62 @@ class ManageCategoriesDialog(tk.Toplevel):
 
 
 class SettingsDialog(tk.Toplevel):
-    """One place for every configurable option: trading parameters, the
-    theme accent color (color wheel), auto-refresh cadence, and the item
-    blacklist. Trading-parameter fields are bound directly to the SAME
-    StringVars the app already reads via _get_purse()/_get_sleep_hours()/
-    etc. - this dialog is now the only place those get edited, nothing
-    downstream had to change."""
+    """One place for every configurable option except the three you tune
+    most often (Purse, Spread, Run Time - those live on the main window
+    now, see BazaarFlipperApp._build_widgets): the remaining trading
+    parameters, the theme accent color (color wheel), auto-refresh
+    cadence, and the item blacklist. Fields are bound directly to the SAME
+    StringVars the app already reads via _get_purse()/_get_risk_floor()/
+    etc. - this dialog is the only place those get edited, nothing
+    downstream had to change.
+
+    Resizable and scrollable (instead of a fixed-height fixed-size window)
+    so the whole thing still fits - and is reachable - on a small/short
+    screen; the Save/Cancel row stays pinned to the bottom of the window
+    rather than scrolling out of view with everything else."""
     def __init__(self, app):
         super().__init__(app)
         self.app = app
         self.title("Settings")
         self.configure(bg=BG_PANEL)
-        self.resizable(False, False)
         self.transient(app)
+
+        # Size to fit the screen instead of a fixed height that can exceed
+        # a small/short display - the scrollable body below handles any
+        # content that still doesn't fit.
+        self.update_idletasks()
+        screen_h = self.winfo_screenheight()
+        height = max(360, min(640, screen_h - 120))
+        self.geometry(f"480x{height}")
+        self.minsize(360, 280)
+        self.resizable(True, True)
         self.grab_set()
 
-        tk.Frame(self, bg=ACCENT, height=3).pack(fill="x")
-        outer = tk.Frame(self, bg=BG_PANEL)
+        tk.Frame(self, bg=ACCENT, height=3).pack(side="top", fill="x")
+
+        # Save/Cancel pinned to the bottom, outside the scroll area, so
+        # they're always reachable no matter how far the content scrolls.
+        btn_row = tk.Frame(self, bg=BG_PANEL)
+        btn_row.pack(side="bottom", fill="x", padx=20, pady=12)
+        ttk.Button(btn_row, text="Save", command=self._save).pack(side="left")
+        ttk.Button(btn_row, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="left", padx=8)
+        tk.Frame(self, bg=BORDER_SUBTLE, height=1).pack(side="bottom", fill="x")
+
+        body_scroll = VerticalScrollFrame(self, bg=BG_PANEL)
+        body_scroll.pack(side="top", fill="both", expand=True)
+        outer = tk.Frame(body_scroll.inner, bg=BG_PANEL)
         outer.pack(fill="both", expand=True, padx=20, pady=16)
 
         tk.Label(outer, text="Settings", font=FONT_HEAD, bg=BG_PANEL, fg=ACCENT).pack(anchor="w", pady=(0, 12))
 
         # --- Trading Parameters ---
+        # Purse, Spread, and Run Time live on the main window now - only
+        # the less-frequently-touched risk parameters stay here.
         self._section(outer, "Trading Parameters")
         params = tk.Frame(outer, bg=BG_PANEL)
         params.pack(fill="x", pady=(0, 14))
-        self._param_row(params, "Purse (coins):", app.purse_var)
-        self._param_row(params, "Sleep Hours:", app.sleep_hours_var)
-        self._param_row(params, "Spread (# items):", app.spread_var)
         self._param_row(params, "Min $Vol/day:", app.risk_floor_var)
+        self._param_row(params, "Min Weekly Sales:", app.min_weekly_sales_var)
         self._param_row(params, "Buy Buffer %:", app.buy_buffer_var)
 
         # --- Appearance ---
@@ -1853,12 +1897,6 @@ class SettingsDialog(tk.Toplevel):
         check_btn.pack(anchor="w", pady=(4, 0))
         hoverable(check_btn, BG_INPUT, ACCENT_SOFT)
 
-        # --- Save/Cancel ---
-        btn_row = tk.Frame(outer, bg=BG_PANEL)
-        btn_row.pack(fill="x", pady=(8, 0))
-        ttk.Button(btn_row, text="Save", command=self._save).pack(side="left")
-        ttk.Button(btn_row, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="left", padx=8)
-
     def _section(self, parent, text):
         tk.Label(parent, text=text, font=FONT_SUBHEAD, bg=BG_PANEL, fg=TEXT_MAIN).pack(anchor="w", pady=(2, 6))
 
@@ -1936,20 +1974,17 @@ class ManualStorageDialog(tk.Toplevel):
         self.configure(bg=BG_PANEL)
         self.resizable(False, False)
         self.transient(parent)
-        self.grab_set()
         self.on_add = on_add
 
-        pad = {"padx": 18, "pady": 6}
-
         tk.Frame(self, bg=ACCENT, height=3).pack(fill="x")
-        tk.Label(self, text="Add Item to Storage", font=FONT_HEAD, bg=BG_PANEL, fg=ACCENT).pack(
-            anchor="w", padx=18, pady=(12, 6))
-        tk.Label(self, text="Manually track any item, price, or note - not just flips already "
-                             "found by the scanner.", font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_DIM,
-                 wraplength=360, justify="left").pack(anchor="w", padx=18, pady=(0, 8))
+        outer = tk.Frame(self, bg=BG_PANEL)
+        outer.pack(fill="both", expand=True, padx=20, pady=16)
 
-        form = tk.Frame(self, bg=BG_PANEL)
-        form.pack(fill="x", padx=18)
+        tk.Label(outer, text="Add Item to Storage", font=FONT_HEAD, bg=BG_PANEL, fg=ACCENT).pack(
+            anchor="w", pady=(0, 4))
+        tk.Label(outer, text="Manually track any item, price, or note - not just flips already "
+                              "found by the scanner.", font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_DIM,
+                 wraplength=380, justify="left").pack(anchor="w", pady=(0, 14))
 
         self.name_var = tk.StringVar()
         self.category_var = tk.StringVar(value="Manual")
@@ -1958,32 +1993,36 @@ class ManualStorageDialog(tk.Toplevel):
         self.qty_var = tk.StringVar(value="1")
         self.notes_var = tk.StringVar()
 
-        def row(label, var, values=None, width=26):
-            r = tk.Frame(form, bg=BG_PANEL)
-            r.pack(fill="x", pady=4)
-            tk.Label(r, text=label, font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_DIM,
-                     width=14, anchor="w").pack(side="left")
-            if values is not None:
-                widget = ttk.Combobox(r, textvariable=var, values=values, width=width - 3)
-            else:
-                widget = ttk.Entry(r, textvariable=var, width=width)
-            widget.pack(side="left")
-            return widget
+        # --- Item ---
+        self._section(outer, "Item")
+        item_grid = tk.Frame(outer, bg=BG_PANEL)
+        item_grid.pack(fill="x", pady=(0, 14))
+        item_grid.columnconfigure(1, weight=1)
+        name_entry = self._grid_entry(item_grid, 0, "Item Name:", self.name_var)
+        self._grid_entry(item_grid, 1, "Category:", self.category_var,
+                          values=sorted(existing_categories))
 
-        name_entry = row("Item Name:", self.name_var)
-        row("Category:", self.category_var, values=sorted(existing_categories))
-        row("Buy Price:", self.buy_var)
-        row("Sell Price:", self.sell_var)
-        row("Quantity:", self.qty_var)
-        row("Notes:", self.notes_var)
+        # --- Pricing ---
+        self._section(outer, "Pricing (optional)")
+        price_row = tk.Frame(outer, bg=BG_PANEL)
+        price_row.pack(fill="x", pady=(0, 2))
+        self._inline_field(price_row, "Buy:", self.buy_var, width=12)
+        self._inline_field(price_row, "Sell:", self.sell_var, width=12, padx=(18, 0))
+        tk.Label(outer, text="Leave both blank to store this as a plain note.",
+                 font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_FAINT).pack(anchor="w", pady=(4, 14))
 
-        tk.Label(self, text="Buy/Sell price are optional - leave blank for a plain note.",
-                 font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_FAINT).pack(anchor="w", padx=18, pady=(4, 0))
+        # --- Details ---
+        self._section(outer, "Details")
+        details_grid = tk.Frame(outer, bg=BG_PANEL)
+        details_grid.pack(fill="x", pady=(0, 4))
+        details_grid.columnconfigure(1, weight=1)
+        self._grid_entry(details_grid, 0, "Quantity:", self.qty_var)
+        self._grid_entry(details_grid, 1, "Notes:", self.notes_var)
 
         name_entry.focus_set()
 
-        btn_row = tk.Frame(self, bg=BG_PANEL)
-        btn_row.pack(pady=(14, 16), padx=18, fill="x")
+        btn_row = tk.Frame(outer, bg=BG_PANEL)
+        btn_row.pack(fill="x", pady=(18, 0))
 
         def do_add():
             name = self.name_var.get().strip()
@@ -2018,7 +2057,34 @@ class ManualStorageDialog(tk.Toplevel):
             self.destroy()
 
         ttk.Button(btn_row, text="Add", command=do_add).pack(side="left")
-        ttk.Button(btn_row, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="right")
+        ttk.Button(btn_row, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="left", padx=8)
+
+        # Center over the parent window now that the final size is known.
+        self.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        w, h = self.winfo_width(), self.winfo_height()
+        self.geometry(f"+{px + (pw - w) // 2}+{py + (ph - h) // 3}")
+        self.grab_set()
+
+    def _section(self, parent, text):
+        tk.Label(parent, text=text, font=FONT_SUBHEAD, bg=BG_PANEL, fg=TEXT_MAIN).pack(anchor="w", pady=(0, 6))
+
+    def _grid_entry(self, grid, row_idx, label, var, values=None):
+        tk.Label(grid, text=label, font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_DIM,
+                 width=11, anchor="w").grid(row=row_idx, column=0, sticky="w", pady=4)
+        if values is not None:
+            widget = ttk.Combobox(grid, textvariable=var, values=values)
+        else:
+            widget = ttk.Entry(grid, textvariable=var)
+        widget.grid(row=row_idx, column=1, sticky="ew", pady=4)
+        return widget
+
+    def _inline_field(self, parent, label, var, width=12, padx=(0, 0)):
+        wrap = tk.Frame(parent, bg=BG_PANEL)
+        wrap.pack(side="left", padx=padx)
+        tk.Label(wrap, text=label, font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_DIM).pack(side="left", padx=(0, 6))
+        ttk.Entry(wrap, textvariable=var, width=width).pack(side="left")
 
 
 class StorageCard(tk.Frame):
@@ -2490,15 +2556,17 @@ class BazaarFlipperApp(tk.Tk):
     def _build_widgets(self):
         # Row 1: refresh + settings + manage categories + view toggle.
         # NOTE: this row used to also hold five separate Entry fields
-        # (Purse/Sleep/Spread/MinVol/BuyBuffer) plus an Apply button. On a
-        # non-maximized window those pushed the row wider than the visible
-        # area - pack() doesn't wrap, so the rightmost widgets (the
-        # Overnight Plan / Full List toggle) got squeezed off past the
-        # edge of the window instead of actually disappearing. Moving
-        # those five fields into the Settings dialog (they still write to
-        # the exact same StringVars, so nothing downstream changed) keeps
-        # this row short enough to never overflow a reasonably-sized
-        # window.
+        # (Purse/Sleep/Spread/MinVol/BuyBuffer) plus an Apply button, all
+        # crammed into one row. On a non-maximized window those pushed the
+        # row wider than the visible area - pack() doesn't wrap, so the
+        # rightmost widgets (the Overnight Plan / Full List toggle) got
+        # squeezed off past the edge of the window instead of actually
+        # disappearing. Purse/Spread/Run Time are frequently-tuned enough
+        # to earn a spot on the main window, so they're back - but on
+        # their OWN row (params_bar, below) instead of sharing this one,
+        # so this button row can never overflow again. The two
+        # less-frequently-touched risk knobs (Min $Vol/day, Buy Buffer %)
+        # plus the new Min Weekly Sales floor stay in the Settings dialog.
         top_bar_wrap = tk.Frame(self, bg=BG_DARK)
         top_bar_wrap.pack(fill="x")
         top_bar = ttk.Frame(top_bar_wrap, padding=(14, 14, 14, 14), style="TopBar.TFrame")
@@ -2506,13 +2574,13 @@ class BazaarFlipperApp(tk.Tk):
         tk.Frame(top_bar_wrap, bg=ACCENT, height=2).pack(fill="x")
         self.top_bar_wrap = top_bar_wrap
 
-        # StringVars for the trading parameters - no Entry widgets live in
-        # this bar anymore, they're edited from the Settings dialog, but
-        # every place that reads them (_get_purse etc.) is unchanged.
+        # StringVars for the trading parameters.
         self.purse_var = tk.StringVar(value=self.settings.get("purse", "10000000"))
         self.sleep_hours_var = tk.StringVar(value=self.settings.get("sleep_hours", str(DEFAULT_SLEEP_HOURS)))
         self.spread_var = tk.StringVar(value=self.settings.get("spread_n", str(DEFAULT_SPREAD_N)))
         self.risk_floor_var = tk.StringVar(value=self.settings.get("risk_floor", str(DEFAULT_PLAN_MIN_DAILY_VOLUME)))
+        self.min_weekly_sales_var = tk.StringVar(
+            value=self.settings.get("min_weekly_sales", str(DEFAULT_MIN_WEEKLY_SALES)))
         self.buy_buffer_var = tk.StringVar(value=self.settings.get("buy_buffer_pct", str(DEFAULT_BUY_BUFFER_PCT)))
 
         self.refresh_btn = ttk.Button(top_bar, text="\u21bb  Refresh Market Data", command=self.refresh)
@@ -2541,6 +2609,30 @@ class BazaarFlipperApp(tk.Tk):
         self.storage_btn = ttk.Button(view_frame, text="\U0001F4E6 Storage",
                                        command=lambda: self.set_view("storage"))
         self.storage_btn.pack(side="left", padx=(4, 0))
+
+        # Row 1b: Purse / Spread / Run Time - its own row so it can never
+        # crowd out the buttons above, and long enough on its own that a
+        # small window just wraps naturally into extra vertical space
+        # rather than clipping anything.
+        params_bar = ttk.Frame(self, padding=(14, 0, 14, 10), style="TopBar.TFrame")
+        params_bar.pack(fill="x")
+        params_bar_divider = tk.Frame(self, bg=BORDER_SUBTLE, height=1)
+        params_bar_divider.pack(fill="x")
+        self.params_bar_wrap = params_bar_divider  # anchor for packing the category bar after this
+
+        def _param_field(label_text, var):
+            ttk.Label(params_bar, text=label_text, style="TopBarDim.TLabel").pack(side="left", padx=(0, 6))
+            entry = ttk.Entry(params_bar, textvariable=var, width=12)
+            entry.pack(side="left", padx=(0, 16))
+            entry.bind("<Return>", lambda e: self.recompute_and_render())
+            entry.bind("<FocusOut>", lambda e: self.recompute_and_render())
+            return entry
+
+        _param_field("Purse (coins):", self.purse_var)
+        _param_field("Run Time (hrs):", self.sleep_hours_var)
+        _param_field("Spread (# items):", self.spread_var)
+        ttk.Button(params_bar, text="Apply", style="Secondary.TButton",
+                   command=self.recompute_and_render).pack(side="left")
 
         # Row 2: shared search/filter controls for the browsable views.
         self.category_bar_wrap = ttk.Frame(self, padding=(14, 10, 14, 6))
@@ -2633,7 +2725,7 @@ class BazaarFlipperApp(tk.Tk):
         self.view_mode = mode
         self._refresh_view_buttons()
         if mode in ("full", "event_engine"):
-            self.category_bar_wrap.pack(fill="x", after=self.top_bar_wrap)
+            self.category_bar_wrap.pack(fill="x", after=self.params_bar_wrap)
         else:
             self.category_bar_wrap.pack_forget()
         is_event_engine = mode == "event_engine"
@@ -3153,7 +3245,17 @@ class BazaarFlipperApp(tk.Tk):
         """Snapshots the CURRENT numbers off a live flip card into a
         standalone Storage entry. This is a copy, not a live link - the
         bazaar keeps moving, so what you saved is what you saw at the
-        moment you clicked "Add to Storage," not an auto-updating quote."""
+        moment you clicked "Add to Storage," not an auto-updating quote.
+
+        Quantity mirrors whatever the card was actually showing: the
+        Overnight Plan's planned buy quantity ("units") in portfolio mode,
+        or the purse-limited achievable quantity ("achievable_units") in
+        Full List mode - not a flat 1."""
+        quantity = flip.get("units")
+        if not quantity:
+            quantity = flip.get("achievable_units")
+        quantity = max(1, int(quantity or 1))
+
         entry = {
             "entry_id": self._next_storage_entry_id(),
             "source": "flip",
@@ -3164,7 +3266,7 @@ class BazaarFlipperApp(tk.Tk):
             "sell_at": flip.get("sell_offer_at"),
             "profit": flip.get("profit"),
             "margin": flip.get("margin"),
-            "quantity": 1,
+            "quantity": quantity,
             "notes": "",
             "added_ts": time.time(),
         }
@@ -3408,6 +3510,14 @@ class BazaarFlipperApp(tk.Tk):
                                     "Enter a number for the minimum daily coin volume.")
             return DEFAULT_PLAN_MIN_DAILY_VOLUME
 
+    def _get_min_weekly_sales(self):
+        try:
+            return max(0.0, float(self.min_weekly_sales_var.get().replace(",", "")))
+        except ValueError:
+            messagebox.showwarning("Invalid Min Weekly Sales",
+                                    "Enter a number for the minimum weekly unit sales.")
+            return DEFAULT_MIN_WEEKLY_SALES
+
     def _get_buy_buffer_pct(self):
         try:
             return max(0.0, float(self.buy_buffer_var.get().replace(",", "").replace("%", "")))
@@ -3648,8 +3758,9 @@ class BazaarFlipperApp(tk.Tk):
             sleep_hours = self._get_sleep_hours()
             target_n = self._get_spread_n()
             risk_floor = self._get_risk_floor()
+            min_weekly_sales = self._get_min_weekly_sales()
             portfolio, leftover, risk_excluded = compute_portfolio(
-                list(flips), purse, sleep_hours, target_n, risk_floor)
+                list(flips), purse, sleep_hours, target_n, risk_floor, min_weekly_sales)
             rows = portfolio
             visible_rows = rows
             more_remaining = 0
@@ -3662,7 +3773,8 @@ class BazaarFlipperApp(tk.Tk):
 
             risk_note = (
                 f" Skipped {risk_excluded} item(s) flagged as extreme-margin, price-deviation "
-                f"suspects, or under {risk_floor:,.0f} coins/day in turnover, to keep this plan "
+                f"suspects, under {risk_floor:,.0f} coins/day in turnover, or under "
+                f"{min_weekly_sales:,.0f} units/week in actual trailing sales, to keep this plan "
                 f"safer to leave unattended."
                 if risk_excluded else ""
             )
@@ -3734,6 +3846,7 @@ class BazaarFlipperApp(tk.Tk):
             "sleep_hours": self.sleep_hours_var.get(),
             "spread_n": self.spread_var.get(),
             "risk_floor": self.risk_floor_var.get(),
+            "min_weekly_sales": self.min_weekly_sales_var.get(),
             "buy_buffer_pct": self.buy_buffer_var.get(),
             "auto_refresh_enabled": self.auto_refresh_enabled,
             "auto_refresh_minutes": self.auto_refresh_minutes,
