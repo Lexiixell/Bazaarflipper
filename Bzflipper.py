@@ -59,7 +59,7 @@ MIN_AUTO_REFRESH_MINUTES = 1  # floor - avoids hammering Hypixel's API if
 # downloadable asset - a bare tag or commit wouldn't give the user
 # anything to click through to.
 #
-APP_VERSION = "1.1.2"  # bump this string with each GitHub release you publish
+APP_VERSION = "1.1.3"  # bump this string with each GitHub release you publish
 GITHUB_REPO = "Lexiixell/Bazaarflipper"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -1125,7 +1125,8 @@ def compute_purse_metrics(flips, purse):
     return flips
 
 
-def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume, min_weekly_volume=0):
+def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume, min_weekly_volume=0,
+                       price_trends=None):
     """Spread `purse` across up to `target_n` of the best flips, sized so
     each item's slice is realistically fillable within `sleep_hours` -
     instead of one all-in pick.
@@ -1163,14 +1164,23 @@ def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume
     liquidity over the window can absorb (water-fill), so a thin item
     doesn't hog a slot's worth of coins it can't actually place.
 
-    Returns (portfolio_list, leftover_purse, risk_excluded_count).
-    Each item in portfolio_list is the original flip dict with "units",
-    "coins", and "profit_window" added.
+    If price_trends is given ({product_id: {"direction", "pct_change"}}
+    from BazaarFlipperApp.get_price_trend), each candidate's ranking score
+    gets a small multiplier from its own 24h trend: a RISING item nudges
+    up (you're buying in before the price likely climbs further, which is
+    upside for the sell-side of the flip), a FALLING item nudges down
+    (you're about to buy into a slide, which works against you on the
+    buy-side and risks the sell-side dropping further before you offload).
+    This only re-ranks candidates already cleared by the four risk filters
+    above - it never overrides them, and an item with no trend data yet
+    (price_trends.get returns None) is scored as neutral (1.0x), not
+    penalized, since "unknown" isn't evidence of anything.
     """
     sleep_hours = max(0.1, sleep_hours)
     target_n = max(1, int(target_n))
     min_daily_coin_volume = max(0, min_daily_coin_volume)
     min_weekly_volume = max(0, min_weekly_volume)
+    price_trends = price_trends or {}
 
     base_pool = [f for f in flips if f.get("cost_per_item", 0) > 0 and f.get("hourly_volume", 0) > 0]
     candidates = [
@@ -1189,8 +1199,21 @@ def compute_portfolio(flips, purse, sleep_hours, target_n, min_daily_coin_volume
         budget_units = int(avg_slot_budget // f["cost_per_item"])
         f["_window_units"] = window_units
         f["_score_units"] = min(window_units, budget_units)
+
+        trend = price_trends.get(f["id"])
+        if trend is None:
+            trend_mult = 1.0
+        elif trend["direction"] == "rising":
+            trend_mult = 1.15
+        elif trend["direction"] == "falling":
+            trend_mult = 0.85
+        else:
+            trend_mult = 1.0
+        f["_trend_mult"] = trend_mult
+        f["price_trend"] = trend
+
     candidates = [f for f in candidates if f["_score_units"] > 0]
-    candidates.sort(key=lambda f: f["_score_units"] * f["profit"], reverse=True)
+    candidates.sort(key=lambda f: f["_score_units"] * f["profit"] * f["_trend_mult"], reverse=True)
 
     portfolio = []
     remaining_purse = purse
@@ -1327,7 +1350,7 @@ class FlipCard(tk.Frame):
     """A collapsible box for one item. Header shows name/category/quick
     number; tapping it expands a detail grid with every field inside."""
     def __init__(self, parent, flip, mode, on_set_category, sleep_hours=None, on_blacklist=None,
-                 market_context=None, on_add_storage=None):
+                 market_context=None, on_add_storage=None, trend=None):
         super().__init__(parent, bg=BORDER_SUBTLE)
         self.flip = flip
         self.mode = mode
@@ -1335,6 +1358,7 @@ class FlipCard(tk.Frame):
         self.on_set_category = on_set_category
         self.on_blacklist = on_blacklist
         self.on_add_storage = on_add_storage
+        self.trend = trend
         # market_context carries {"active_event_keys": set(...),
         # "paul_discount_active": bool} so the card can badge itself
         # against what's ACTUALLY live right now, not just what keywords
@@ -1388,6 +1412,16 @@ class FlipCard(tk.Frame):
             badge_lbl.pack(side="left", padx=(8, 0), pady=5)
             badge_widgets.append(badge_lbl)
 
+        trend_lbl = None
+        if self.trend is not None:
+            arrow = {"rising": "\u2191", "falling": "\u2193", "flat": "\u2192"}.get(self.trend["direction"], "")
+            trend_color = {"rising": ACCENT_GREEN, "falling": ACCENT_RED,
+                           "flat": TEXT_DIM}.get(self.trend["direction"], TEXT_DIM)
+            trend_lbl = tk.Label(header, text=f"{arrow} {self.trend['pct_change']:+.1f}%", font=FONT_PILL,
+                                  bg=BG_PANEL, fg=trend_color)
+            trend_lbl.pack(side="left", padx=(8, 0), pady=5)
+            badge_widgets.append(trend_lbl)
+
         self.arrow_lbl = tk.Label(header, text="\u25b6", font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_FAINT)
         self.arrow_lbl.pack(side="right", padx=(0, 10), pady=5)
 
@@ -1436,6 +1470,10 @@ class FlipCard(tk.Frame):
 
         if flip.get("price_deviation_pct") is not None:
             rows.append(("7d Price Deviation", f"{flip['price_deviation_pct']:.1f}%"))
+
+        if self.trend is not None:
+            rows.append(("24h Price Trend",
+                         f"{self.trend['direction'].capitalize()} ({self.trend['pct_change']:+.1f}%)"))
 
         if self.mode == "portfolio":
             rows.append(("Units to Buy", f"{flip['units']:,}"))
@@ -2093,12 +2131,14 @@ class StorageCard(tk.Frame):
     'manual'). Mirrors FlipCard's look/collapse behavior so Storage feels
     like part of the same app, but its fields come from the stored entry
     dict itself rather than a live bazaar snapshot."""
-    def __init__(self, parent, entry, on_remove):
+    def __init__(self, parent, entry, on_remove, recommendation=None, trend=None):
         super().__init__(parent, bg=BORDER_SUBTLE)
         self.entry = entry
         self.expanded = False
         self.detail = None
         self.on_remove = on_remove
+        self.recommendation = recommendation
+        self.trend = trend
 
         inner = tk.Frame(self, bg=BG_PANEL)
         inner.pack(fill="both", expand=True)
@@ -2124,6 +2164,24 @@ class StorageCard(tk.Frame):
         source_lbl = tk.Label(header, text=source_text, font=FONT_PILL, bg=BG_PANEL, fg=TEXT_FAINT)
         source_lbl.pack(side="left", padx=(8, 0), pady=5)
 
+        rec_lbl = None
+        if recommendation is not None:
+            action = recommendation.action
+            action_color = {"buy": ACCENT_GREEN, "sell": ACCENT_RED,
+                            "hold": ACCENT_YELLOW}.get(action, TEXT_DIM)
+            rec_lbl = tk.Label(header, text=f"\u2192 {action.upper()}", font=FONT_PILL,
+                                bg=BG_PANEL, fg=action_color)
+            rec_lbl.pack(side="left", padx=(8, 0), pady=5)
+
+        trend_lbl = None
+        if trend is not None:
+            arrow = {"rising": "\u2191", "falling": "\u2193", "flat": "\u2192"}.get(trend["direction"], "")
+            trend_color = {"rising": ACCENT_GREEN, "falling": ACCENT_RED,
+                           "flat": TEXT_DIM}.get(trend["direction"], TEXT_DIM)
+            trend_lbl = tk.Label(header, text=f"{arrow} {trend['pct_change']:+.1f}%", font=FONT_PILL,
+                                  bg=BG_PANEL, fg=trend_color)
+            trend_lbl.pack(side="left", padx=(8, 0), pady=5)
+
         self.arrow_lbl = tk.Label(header, text="\u25b6", font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_FAINT)
         self.arrow_lbl.pack(side="right", padx=(0, 10), pady=5)
 
@@ -2138,6 +2196,10 @@ class StorageCard(tk.Frame):
         quick_lbl.pack(side="right", padx=(0, 10), pady=5)
 
         toggle_widgets = [header, name_lbl, cat_lbl, source_lbl, quick_lbl, self.arrow_lbl]
+        if rec_lbl is not None:
+            toggle_widgets.append(rec_lbl)
+        if trend_lbl is not None:
+            toggle_widgets.append(trend_lbl)
         for w in toggle_widgets:
             w.bind("<Button-1>", self.toggle)
 
@@ -2179,6 +2241,35 @@ class StorageCard(tk.Frame):
         if entry.get("notes"):
             tk.Label(self.detail, text="Notes: " + entry["notes"], font=FONT_MAIN, bg=BG_PANEL_RAISED,
                      fg=TEXT_DIM, wraplength=900, justify="left").pack(anchor="w", padx=16, pady=(2, 6))
+
+        if self.recommendation is not None:
+            rec = self.recommendation
+            conf = max(rec.buy_confidence, rec.sell_confidence)
+            tk.Label(self.detail,
+                     text=(f"Event-engine signal: {rec.action.upper()} "
+                           f"({conf:.0f}% confidence, {rec.expected_appreciation:+.1f}% expected)"),
+                     font=FONT_SUBHEAD, bg=BG_PANEL_RAISED, fg=TEXT_MAIN).pack(
+                anchor="w", padx=16, pady=(6, 2))
+            if rec.explanation:
+                reasoning_text = "\n".join(f"\u2022 {line}" for line in rec.explanation)
+                tk.Label(self.detail, text=reasoning_text, font=FONT_MAIN, bg=BG_PANEL_RAISED,
+                         fg=TEXT_DIM, wraplength=880, justify="left").pack(
+                    anchor="w", padx=16, pady=(0, 6))
+        elif self.entry.get("product_id"):
+            tk.Label(self.detail,
+                     text="No event-engine signal yet for this item (needs recorded event "
+                          "history to compare against).",
+                     font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=TEXT_FAINT,
+                     wraplength=880, justify="left").pack(anchor="w", padx=16, pady=(2, 6))
+
+        if self.trend is not None:
+            trend_color = {"rising": ACCENT_GREEN, "falling": ACCENT_RED,
+                           "flat": TEXT_DIM}.get(self.trend["direction"], TEXT_DIM)
+            tk.Label(self.detail,
+                     text=(f"Price trend (24h, own history): {self.trend['direction'].upper()} "
+                           f"({self.trend['pct_change']:+.1f}%)"),
+                     font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=trend_color).pack(
+                anchor="w", padx=16, pady=(2, 6))
 
         btn_row = tk.Frame(self.detail, bg=BG_PANEL_RAISED)
         btn_row.pack(anchor="w", padx=16, pady=(2, 12))
@@ -3139,6 +3230,80 @@ class BazaarFlipperApp(tk.Tk):
             })
         return sections
 
+    def get_price_trend(self, product_id, lookback_hours=24):
+        """Rising/Falling/Flat based purely on this item's own local price
+        history (self.price_history) - independent of the event engine,
+        so it works immediately with no event-occurrence requirement.
+        Compares the oldest sample within the lookback window against the
+        newest sample overall. Returns None if there isn't enough history
+        yet to say anything."""
+        if not product_id:
+            return None
+        samples = self.price_history.get(product_id, [])
+        if len(samples) < 2:
+            return None
+
+        now = time.time()
+        cutoff = now - lookback_hours * 3600
+        in_window = [s for s in samples if s[0] >= cutoff]
+        if len(in_window) < 2:
+            in_window = samples[-2:]
+
+        oldest = in_window[0]
+        newest = samples[-1]
+
+        old_price = (oldest[1] + oldest[2]) / 2
+        new_price = (newest[1] + newest[2]) / 2
+        if old_price <= 0:
+            return None
+
+        pct_change = ((new_price - old_price) / old_price) * 100
+        if pct_change > 3:
+            direction = "rising"
+        elif pct_change < -3:
+            direction = "falling"
+        else:
+            direction = "flat"
+
+        return {"direction": direction, "pct_change": round(pct_change, 1)}
+
+    def get_storage_recommendation(self, entry):
+        """Looks up the current Buy/Hold/Sell recommendation for a Storage
+        entry, if any. Only works for entries with a product_id (i.e. saved
+        from a live flip card, or a manual entry that matched a known item
+        name) - manual entries with no resolvable product_id return None
+        rather than a guess. If the item is tagged relevant to more than
+        one seasonal event, returns whichever has the higher confidence;
+        does not average or combine them."""
+        product_id = entry.get("product_id")
+        if not product_id:
+            return None
+        event_keys = tag_event_relevance(product_id)
+        if not event_keys:
+            return None
+
+        try:
+            pipeline_obj = self._get_event_pipeline()
+        except Exception:
+            return None
+
+        best = None
+        as_of_ts = int(time.time())
+        for event_type in event_keys:
+            try:
+                instances = pipeline_obj.db.load_event_instances(event_type)
+                if not instances:
+                    continue
+                rec = pipeline_obj.generate_recommendation(product_id, instances[-1], as_of_ts)
+            except Exception:
+                rec = None
+            if rec is None:
+                continue
+            if best is None or max(rec.buy_confidence, rec.sell_confidence) > \
+                    max(best.buy_confidence, best.sell_confidence):
+                best = rec
+        return best
+
     def open_manage_categories(self):
         counts = {}
         for f in self.all_flips:
@@ -3288,10 +3453,19 @@ class BazaarFlipperApp(tk.Tk):
             profit = round(post_tax - buy_at, 1)
             margin = round((profit / buy_at) * 100, 1)
 
+        # Best-effort match against known bazaar items so a manually-typed
+        # entry can still get an event-engine recommendation later. Only
+        # matches on exact (case-insensitive) display name - doesn't guess
+        # on partial/fuzzy matches, since a wrong match would silently show
+        # the wrong item's signal.
+        typed_name = data.get("item", "").strip().lower()
+        match = next((f for f in self.all_flips if f["item"].lower() == typed_name), None)
+        product_id = match["id"] if match else None
+
         entry = {
             "entry_id": self._next_storage_entry_id(),
             "source": "manual",
-            "product_id": None,
+            "product_id": product_id,
             "item": data.get("item", "Unknown Item"),
             "category": data.get("category") or "Manual",
             "buy_at": buy_at,
@@ -3542,9 +3716,10 @@ class BazaarFlipperApp(tk.Tk):
                 if event_key:
                     flips = [f for f in flips if event_key in f.get("event_tags", [])]
 
-        query = self.search_var.get().strip().lower()
-        if query:
-            flips = [f for f in flips if query in f["item"].lower() or query in f["category"].lower()]
+        if self.view_mode == "full":
+            query = self.search_var.get().strip().lower()
+            if query:
+                flips = [f for f in flips if query in f["item"].lower() or query in f["category"].lower()]
 
         return flips
 
@@ -3632,8 +3807,9 @@ class BazaarFlipperApp(tk.Tk):
             text="Items you've pinned for later, either saved straight off a flip card or typed in "
                  "by hand. These are a snapshot of the numbers at the time they were added, not a "
                  "live quote - refresh the Full List and re-add if you want the current price. "
-                 "Saved to your local user data folder, so this list survives app restarts and "
-                 "updates.")
+                 "Where available, a Buy/Hold/Sell badge from the Event Engine is shown next to "
+                 "each item - tap it for the reasoning. Saved to your local user data folder, so "
+                 "this list survives app restarts and updates.")
 
         query = self.search_var.get().strip().lower()
         entries = list(self.storage)
@@ -3653,7 +3829,10 @@ class BazaarFlipperApp(tk.Tk):
                      fg=TEXT_DIM, wraplength=1000, justify="left").pack(anchor="w", padx=4, pady=12)
         else:
             for entry in entries:
-                card = StorageCard(self.cards_scroll.inner, entry, self.remove_from_storage)
+                rec = self.get_storage_recommendation(entry)
+                trend = self.get_price_trend(entry.get("product_id"))
+                card = StorageCard(self.cards_scroll.inner, entry, self.remove_from_storage,
+                                    recommendation=rec, trend=trend)
                 card.pack(fill="x", pady=1)
 
         self.count_var.set(f"Showing {len(entries)} of {len(self.storage)} storage item(s)")
@@ -3759,8 +3938,10 @@ class BazaarFlipperApp(tk.Tk):
             target_n = self._get_spread_n()
             risk_floor = self._get_risk_floor()
             min_weekly_sales = self._get_min_weekly_sales()
+            price_trends = {f["id"]: self.get_price_trend(f["id"]) for f in flips}
             portfolio, leftover, risk_excluded = compute_portfolio(
-                list(flips), purse, sleep_hours, target_n, risk_floor, min_weekly_sales)
+                list(flips), purse, sleep_hours, target_n, risk_floor, min_weekly_sales,
+                price_trends=price_trends)
             rows = portfolio
             visible_rows = rows
             more_remaining = 0
@@ -3785,7 +3966,9 @@ class BazaarFlipperApp(tk.Tk):
                     f"enough safe liquidity to place elsewhere right now).\n"
                     f"Estimated profit over the next {sleep_hours:g}h: ~{total_profit:,.0f} coins "
                     f"(~{total_profit / sleep_hours:,.0f} coins/hr average), buy prices already include "
-                    f"a {self._get_buy_buffer_pct():g}% buffer above the current top buy order. Tap any "
+                    f"a {self._get_buy_buffer_pct():g}% buffer above the current top buy order. Ranking "
+                    f"also weighs each item's own 24h price trend - rising items nudged up, falling "
+                    f"items nudged down. Tap any "
                     f"item below for the full breakdown. Based on real trailing-week turnover \u2014 not "
                     f"a guarantee, the market moves in real time.{risk_note}"
                 ))
@@ -3817,9 +4000,11 @@ class BazaarFlipperApp(tk.Tk):
 
         market_context = self._market_context()
         for f in visible_rows:
+            trend = f.get("price_trend") if "price_trend" in f else self.get_price_trend(f["id"])
             card = FlipCard(self.cards_scroll.inner, f, mode, self.open_category_dialog,
                              sleep_hours=sleep_hours, on_blacklist=self.blacklist_item,
-                             market_context=market_context, on_add_storage=self.add_flip_to_storage)
+                             market_context=market_context, on_add_storage=self.add_flip_to_storage,
+                             trend=trend)
             card.pack(fill="x", pady=1)
 
         if self.view_mode == "full" and more_remaining > 0:
