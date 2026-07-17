@@ -59,7 +59,7 @@ MIN_AUTO_REFRESH_MINUTES = 1  # floor - avoids hammering Hypixel's API if
 # downloadable asset - a bare tag or commit wouldn't give the user
 # anything to click through to.
 #
-APP_VERSION = "1.1.4"  # bump this string with each GitHub release you publish
+APP_VERSION = "1.1.5"  # bump this string with each GitHub release you publish
 GITHUB_REPO = "Lexiixell/Bazaarflipper"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -335,6 +335,135 @@ def year_of_pig_status(now=None):
         "skyblock_day": day,
         "next_pig_year": next_pig_year,
     }
+
+
+# ---- Event forecasting (how far off is the NEXT occurrence?) --------------
+# Everything above answers "is this event live right now?"; the bazaar's
+# event-price engine (event_price_engine/) also wants "when does it NEXT
+# start?", so it can flag an event as ~24h away and pre-position the items
+# tied to it before the price actually moves. That's a pure function of the
+# same fixed SkyBlock calendar the status helpers already use - no API for
+# it, same as get_skyblock_date.
+#
+# Only the events whose next start is BOTH cleanly derivable from the
+# calendar AND rare relative to the lead window get a forecast here:
+#   - Oringo / Traveling Zoo (fixed 50h rotation cycle)
+#   - Jerry's Workshop (SkyBlock Late Winter opening window, once per SB year)
+#   - Harvest Festival (Early Autumn, once per SB year - unless Finnegan's
+#     perk has extended it to run all year, in which case there's no discrete
+#     "next start" worth a heads-up and it's skipped)
+#   - Year of the Pig (once every 12 SB years)
+# The perk-gated, fast-recurring events (Fishing Festival every SB month,
+# Mining Fiesta days 1-7 of five months, Mythological Ritual for a whole
+# term) are deliberately NOT forecast: they either recur far faster than a
+# 24h lead window (so "within 24h" carries no signal) or depend on who wins
+# an election weeks out. They still get real-time detection + item tracking
+# exactly as before - this only adds the "coming soon" layer on top.
+DEFAULT_EVENT_LEAD_HOURS = 24  # how far ahead of an event's start to start
+                                # flagging it as "upcoming" / tracking its items;
+                                # user-overridable in Settings (event_lead_hours).
+
+
+def _next_skyblock_month_start_ts(now, month_index, day=1):
+    """Unix timestamp of the next time the SkyBlock calendar reaches
+    (month_index, day) at 00:00 SB time, strictly after `now`. month_index is
+    0-indexed into SKYBLOCK_MONTH_NAMES; day is 1-indexed. Mirrors the exact
+    day-counting get_skyblock_date() uses, run in reverse."""
+    days_per_year = SKYBLOCK_DAYS_PER_MONTH * SKYBLOCK_MONTHS_PER_YEAR  # 372
+    elapsed = max(0, now - SKYBLOCK_EPOCH_SECONDS)
+    total_sb_days = int(elapsed // SKYBLOCK_DAY_SECONDS)
+    current_year = total_sb_days // days_per_year  # 0-indexed SB year
+    target_day_of_year = month_index * SKYBLOCK_DAYS_PER_MONTH + (day - 1)
+    candidate_sb_day = current_year * days_per_year + target_day_of_year
+    candidate_ts = SKYBLOCK_EPOCH_SECONDS + candidate_sb_day * SKYBLOCK_DAY_SECONDS
+    if candidate_ts <= now:
+        # This year's occurrence is already past (or exactly now) - the next
+        # one is a full SB year later.
+        candidate_ts += days_per_year * SKYBLOCK_DAY_SECONDS
+    return int(candidate_ts)
+
+
+def forecast_events(now=None, mayor_info=None):
+    """Predict the next start time of each cleanly-forecastable event. Returns
+    a list of dicts: {event_key, next_start_ts, recurrence_seconds, source}.
+    recurrence_seconds is roughly how often the event recurs, used downstream
+    to decide whether a fixed lead window (e.g. 24h) is even meaningful for
+    it. Pure/deterministic - safe to call every tick."""
+    if now is None:
+        now = time.time()
+    sb_year_seconds = SKYBLOCK_DAYS_PER_MONTH * SKYBLOCK_MONTHS_PER_YEAR * SKYBLOCK_DAY_SECONDS
+    forecasts = []
+
+    # Oringo / Traveling Zoo - fixed rotation. The next fresh visit start is
+    # always one cycle-remainder away, whether or not it's visiting right now
+    # (if it's here now, this points at the FOLLOWING visit, not "0s").
+    cycle_position = (now - ORINGO_EPOCH_SECONDS) % ORINGO_CYCLE_SECONDS
+    forecasts.append({
+        "event_key": "oringo",
+        "next_start_ts": int(now + (ORINGO_CYCLE_SECONDS - cycle_position)),
+        "recurrence_seconds": ORINGO_CYCLE_SECONDS,
+        "source": "Traveling Zoo rotation cycle",
+    })
+
+    # Jerry's Workshop - SkyBlock Late Winter opening window (once per SB year).
+    forecasts.append({
+        "event_key": "jerry_workshop",
+        "next_start_ts": _next_skyblock_month_start_ts(now, LATE_WINTER_MONTH_INDEX, 1),
+        "recurrence_seconds": sb_year_seconds,
+        "source": "SkyBlock Late Winter calendar window",
+    })
+
+    # Harvest Festival - starts at Early Autumn (the first of the autumn
+    # months) each SB year. If Finnegan's Grand Feast has extended it to run
+    # the whole year, there's no discrete upcoming start to flag.
+    harvest = harvest_festival_status(now, mayor_info)
+    if not harvest.get("finnegan_extended"):
+        early_autumn_index = min(HARVEST_FESTIVAL_MONTH_INDICES)
+        forecasts.append({
+            "event_key": "harvest_festival",
+            "next_start_ts": _next_skyblock_month_start_ts(now, early_autumn_index, 1),
+            "recurrence_seconds": sb_year_seconds,
+            "source": "SkyBlock autumn calendar window",
+        })
+
+    # Year of the Pig - the whole SB year, once every 12 SB years.
+    pig = year_of_pig_status(now)
+    next_pig_year = pig.get("next_pig_year")
+    if next_pig_year:
+        pig_start_ts = SKYBLOCK_EPOCH_SECONDS + (next_pig_year - 1) * sb_year_seconds
+        forecasts.append({
+            "event_key": "year_of_pig",
+            "next_start_ts": int(pig_start_ts),
+            "recurrence_seconds": YEAR_OF_PIG_CYCLE * sb_year_seconds,
+            "source": f"SkyBlock Year {next_pig_year} (12-year zodiac cycle)",
+        })
+
+    return forecasts
+
+
+def upcoming_events_within(now=None, mayor_info=None,
+                            lead_seconds=DEFAULT_EVENT_LEAD_HOURS * 3600,
+                            active_event_keys=None):
+    """Filter forecast_events() down to the events genuinely worth a heads-up
+    right now: not already live, starting within `lead_seconds`, and recurring
+    rarely enough that "within the lead window" actually means something (an
+    event that recurs faster than the lead window is trivially always 'within
+    24h' and carries no signal, so it's dropped). Each returned dict carries a
+    live `seconds_until`, nearest first."""
+    if now is None:
+        now = time.time()
+    active_event_keys = active_event_keys or set()
+    upcoming = []
+    for fc in forecast_events(now, mayor_info):
+        if fc["recurrence_seconds"] <= lead_seconds:
+            continue
+        if fc["event_key"] in active_event_keys:
+            continue  # it's happening now, not "coming up"
+        seconds_until = fc["next_start_ts"] - now
+        if 0 < seconds_until <= lead_seconds:
+            upcoming.append({**fc, "seconds_until": int(seconds_until)})
+    upcoming.sort(key=lambda x: x["seconds_until"])
+    return upcoming
 
 
 # ---- Mayor / election API + seasonal event windows -----------------------
@@ -1884,6 +2013,26 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(interval_row, text=f"minute(s)  (minimum {MIN_AUTO_REFRESH_MINUTES})", font=FONT_MAIN,
                  bg=BG_PANEL, fg=TEXT_MAIN).pack(side="left")
 
+        # --- Seasonal Event Timing ---
+        self._section(outer, "Seasonal Events")
+        events_frame = tk.Frame(outer, bg=BG_PANEL)
+        events_frame.pack(fill="x", pady=(0, 14))
+        tk.Label(events_frame,
+                 text="How far ahead of a seasonal event's start to flag it as “upcoming” "
+                      "and begin tracking its related items. Only events that recur rarely enough "
+                      "for the lead time to matter are forecast (Traveling Zoo, Jerry's Workshop, "
+                      "Harvest Festival, Year of the Pig).",
+                 font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_DIM, wraplength=420,
+                 justify="left").pack(anchor="w", pady=(0, 6))
+        lead_row = tk.Frame(events_frame, bg=BG_PANEL)
+        lead_row.pack(fill="x", pady=2)
+        tk.Label(lead_row, text="Lead time (hours):", font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_DIM,
+                 width=16, anchor="w").pack(side="left")
+        current_lead_hours = getattr(app, "event_lead_seconds",
+                                     DEFAULT_EVENT_LEAD_HOURS * 3600) / 3600.0
+        self.event_lead_var = tk.StringVar(value=f"{current_lead_hours:g}")
+        ttk.Entry(lead_row, textvariable=self.event_lead_var, width=16).pack(side="left")
+
         # --- Oringo Pet Override ---
         self._section(outer, "Oringo (Traveling Zoo)")
         oringo_frame = tk.Frame(outer, bg=BG_PANEL)
@@ -2015,12 +2164,26 @@ class SettingsDialog(tk.Toplevel):
         pet_choice = self.oringo_pet_var.get() if hasattr(self, "oringo_pet_var") else "Auto"
         self.app.settings["oringo_pet_override"] = pet_choice
 
+        # Seasonal-event lead time. Invalid input falls back to the default
+        # rather than blocking the rest of the save.
+        try:
+            lead_hours = max(1.0, float(self.event_lead_var.get()))
+        except (ValueError, AttributeError):
+            lead_hours = DEFAULT_EVENT_LEAD_HOURS
+        self.app.event_lead_seconds = lead_hours * 3600.0
+        self.app.settings["event_lead_hours"] = lead_hours
+
         self.app.settings.update({
             "accent_color": self.accent_var.get(),
             "auto_refresh_enabled": self.app.auto_refresh_enabled,
             "auto_refresh_minutes": self.app.auto_refresh_minutes,
         })
         save_json(SETTINGS_PATH, self.app.settings)
+
+        # Recompute upcoming events immediately so a changed lead time shows in
+        # the status bar / Event Engine without waiting for the next refresh.
+        self.app._recompute_upcoming_forecasts()
+        self.app.events_var.set(self.app._events_status_text())
 
         self.app._schedule_auto_refresh()
         self.app.recompute_and_render()
@@ -2598,6 +2761,17 @@ class BazaarFlipperApp(tk.Tk):
         self.oringo_status_info = oringo_status()
         self.year_of_pig_status_info = year_of_pig_status()
         self._recompute_active_event_keys()
+
+        # How far ahead of a seasonal event's start to flag it as "upcoming"
+        # and start tracking its related items (Settings-adjustable, default
+        # 24h). Must be set before the first bridge_tick, which reads it.
+        try:
+            lead_hours = float(self.settings.get("event_lead_hours", DEFAULT_EVENT_LEAD_HOURS))
+        except (TypeError, ValueError):
+            lead_hours = DEFAULT_EVENT_LEAD_HOURS
+        self.event_lead_seconds = max(1.0, lead_hours) * 3600.0
+        self.upcoming_event_forecasts = []
+        self._recompute_upcoming_forecasts()
 
         self.auto_refresh_enabled = bool(self.settings.get("auto_refresh_enabled", DEFAULT_AUTO_REFRESH_ENABLED))
         try:
@@ -3285,6 +3459,55 @@ class BazaarFlipperApp(tk.Tk):
             })
         return sections
 
+    def _gather_upcoming_event_sections(self):
+        """Pre-event sections for events starting within the lead window
+        (self.upcoming_event_forecasts). For each, its tracked items are scored
+        as a PRE-EVENT signal via the engine's synthetic-future-instance path
+        (Pipeline.generate_recommendation_for_forecast) - "today" lands at a
+        negative relative day, i.e. right where the historical buy window sits,
+        so the same scorer that grades a live event grades "should I position
+        for the one that's coming." Events with no prior recorded occurrence
+        yet still appear (as a bare countdown) so the heads-up is visible even
+        before there's any history to score against. Fails open to []."""
+        upcoming = getattr(self, "upcoming_event_forecasts", [])
+        if not upcoming:
+            return []
+        try:
+            pipeline_obj = self._get_event_pipeline()
+        except Exception:
+            return []
+
+        as_of_ts = int(time.time())
+        sections = []
+        for fc in upcoming:
+            event_type = fc["event_key"]
+            next_start_ts = fc["next_start_ts"]
+            try:
+                prior_instances = pipeline_obj.db.load_event_instances(event_type)
+                item_ids = pipeline_obj.db.load_items_for_event_type(event_type)
+            except Exception:
+                prior_instances, item_ids = [], []
+
+            item_rows = []
+            for item_id in item_ids:
+                try:
+                    rec = pipeline_obj.generate_recommendation_for_forecast(
+                        item_id, event_type, next_start_ts, as_of_ts)
+                except Exception:
+                    rec = None
+                if rec is not None:
+                    item_rows.append({"item_id": item_id, "recommendation": rec})
+
+            sections.append({
+                "event_type": event_type,
+                "next_start_ts": next_start_ts,
+                "seconds_until": fc["seconds_until"],
+                "prior_count": len(prior_instances),
+                "tracked_item_count": len(item_ids),
+                "items": item_rows,
+            })
+        return sections
+
     def get_price_trend(self, product_id, lookback_hours=24):
         """Rising/Falling/Flat based purely on this item's own local price
         history (self.price_history) - independent of the event engine,
@@ -3562,6 +3785,21 @@ class BazaarFlipperApp(tk.Tk):
             keys.add("year_of_pig")
         self.active_event_keys = keys
 
+    def _recompute_upcoming_forecasts(self):
+        """Refresh the list of events starting within the lead window (default
+        24h) and not already live - drives both the status-bar heads-up and
+        the Event Engine's Upcoming section. Fails open to an empty list so a
+        forecasting hiccup never blanks the rest of the UI."""
+        try:
+            self.upcoming_event_forecasts = upcoming_events_within(
+                mayor_info=self.mayor_info,
+                lead_seconds=getattr(self, "event_lead_seconds", DEFAULT_EVENT_LEAD_HOURS * 3600),
+                active_event_keys=getattr(self, "active_event_keys", set()),
+            )
+        except Exception:
+            traceback.print_exc()
+            self.upcoming_event_forecasts = []
+
     def _market_context(self):
         return {
             "active_event_keys": getattr(self, "active_event_keys", set()),
@@ -3590,6 +3828,16 @@ class BazaarFlipperApp(tk.Tk):
             live_labels.append("Year of the Pig")
         if live_labels:
             parts.append("Active: " + ", ".join(live_labels))
+
+        # Heads-up for events crossing into the lead window (~24h out by
+        # default) but not yet live, so their related items can be pre-tracked.
+        upcoming = getattr(self, "upcoming_event_forecasts", [])
+        if upcoming:
+            up_labels = []
+            for fc in upcoming:
+                label, _color = EVENT_BADGE_STYLE.get(fc["event_key"], (fc["event_key"], ACCENT))
+                up_labels.append(f"{label} in {fmt_hours(fc['seconds_until'] / 3600.0)}")
+            parts.append("\u23f3 Upcoming: " + ", ".join(up_labels))
         return "  \u00b7  ".join(parts)
 
     # -- data flow ----------------------------------------------------------
@@ -3665,6 +3913,7 @@ class BazaarFlipperApp(tk.Tk):
             self.oringo_status_info = oringo_status()
             self.year_of_pig_status_info = year_of_pig_status()
             self._recompute_active_event_keys()
+            self._recompute_upcoming_forecasts()
             self.events_var.set(self._events_status_text())
         except Exception:
             traceback.print_exc()
@@ -3902,6 +4151,8 @@ class BazaarFlipperApp(tk.Tk):
         self.card_title.configure(text="Event Engine")
         self.card_body.configure(
             text="Event-driven Buy / Hold / Sell signals built from recorded seasonal occurrences. "
+                 "Events starting within your lead window (Settings, default 24h) show first as "
+                 "⏳ Upcoming, with pre-event signals for their tracked items. "
                  "Confidence is green at 75%+, amber at 50–74%, and red below 50%. "
                  "Use search, event type, and sorting to focus the list.")
         try:
@@ -3918,6 +4169,20 @@ class BazaarFlipperApp(tk.Tk):
         if selected_key:
             sections = [s for s in sections if s["event_type"] == selected_key]
 
+        # Upcoming (pre-event) sections render first - events starting within
+        # the lead window, with pre-event signals for their tracked items. The
+        # header (countdown) shows even when an event has no rows yet, so the
+        # heads-up is visible before any history exists to score.
+        upcoming_sections = self._gather_upcoming_event_sections()
+        if selected_key:
+            upcoming_sections = [s for s in upcoming_sections if s["event_type"] == selected_key]
+        upcoming_shown = 0
+        for section in upcoming_sections:
+            rows = [row for row in section["items"] if not query or query in row["item_id"].lower()]
+            rows.sort(key=self._event_row_sort_value, reverse=self.event_sort_reverse)
+            self._render_upcoming_event_section(section, rows)
+            upcoming_shown += 1
+
         shown = 0
         for section in sections:
             rows = [row for row in section["items"] if not query or query in row["item_id"].lower()]
@@ -3927,13 +4192,16 @@ class BazaarFlipperApp(tk.Tk):
             self._render_event_section(section, rows)
             shown += len(rows)
 
-        if not shown:
+        if not shown and not upcoming_shown:
             tk.Label(self.cards_scroll.inner,
                      text="No event recommendations match the current search or filter. "
                           "Historical signals appear after an event has recorded enough price data.",
                      font=FONT_MAIN, bg=BG_DARK, fg=TEXT_DIM, wraplength=1000,
                      justify="left").pack(anchor="w", padx=4, pady=12)
-        self.count_var.set(f"Showing {shown} event recommendation(s)")
+        count_text = f"Showing {shown} event recommendation(s)"
+        if upcoming_shown:
+            count_text += f" · {upcoming_shown} upcoming"
+        self.count_var.set(count_text)
 
     def _event_row_sort_value(self, row):
         rec = row["recommendation"]
@@ -3946,6 +4214,40 @@ class BazaarFlipperApp(tk.Tk):
         if rec is None:
             return 0.0
         return max(rec.buy_confidence, rec.sell_confidence)
+
+    def _render_upcoming_event_section(self, section, rows):
+        """Header + pre-event item signals for an event that hasn't started yet
+        but is inside the lead window. Visually distinct from
+        _render_event_section (live/past occurrences) by its countdown and
+        amber "upcoming" accent."""
+        event_type = section["event_type"]
+        label, color = EVENT_BADGE_STYLE.get(event_type, (event_type, ACCENT))
+        starts_in = fmt_hours(section["seconds_until"] / 3600.0)
+        start_local = time.strftime("%Y-%m-%d %H:%M", time.localtime(section["next_start_ts"]))
+
+        wrap = tk.Frame(self.cards_scroll.inner, bg=BG_DARK)
+        wrap.pack(fill="x", pady=(4, 12))
+        heading = tk.Frame(wrap, bg=BG_PANEL)
+        heading.pack(fill="x")
+        tk.Frame(heading, bg=ACCENT_YELLOW, width=4).pack(side="left", fill="y")
+        tk.Label(heading, text=f"⏳ {label}", font=FONT_SUBHEAD, bg=BG_PANEL,
+                 fg=color).pack(side="left", padx=(10, 6), pady=9)
+        tk.Label(heading, text=f"starts in ~{starts_in}  ·  {start_local}", font=FONT_MAIN,
+                 bg=BG_PANEL, fg=ACCENT_YELLOW).pack(side="left", pady=9)
+        tk.Label(heading, text=f"tracking {section['tracked_item_count']} item(s) · "
+                 f"{section['prior_count']} prior occurrence(s)", font=FONT_MAIN,
+                 bg=BG_PANEL, fg=TEXT_FAINT).pack(side="right", padx=10, pady=9)
+
+        if not rows:
+            note = ("Pre-event signals appear once this event has at least one recorded past "
+                    "occurrence to compare against - its items are being tracked in the meantime."
+                    if section["prior_count"] == 0 else
+                    "No pre-event signals match the current search.")
+            tk.Label(wrap, text=f"    {note}", font=FONT_MAIN, bg=BG_DARK, fg=TEXT_DIM,
+                     wraplength=1000, justify="left").pack(anchor="w", pady=(2, 4))
+        else:
+            for row in rows:
+                EventItemCard(wrap, row["item_id"], row["recommendation"]).pack(fill="x", pady=(1, 0))
 
     def _render_event_section(self, section, rows):
         event_type = section["event_type"]
@@ -4079,6 +4381,11 @@ class BazaarFlipperApp(tk.Tk):
     def on_close(self):
         if self._auto_refresh_after_id is not None:
             self.after_cancel(self._auto_refresh_after_id)
+        try:
+            from event_price_engine import bazaar_bridge
+            bazaar_bridge.bridge_close(self)
+        except Exception:
+            traceback.print_exc()
         if self._event_pipeline is not None:
             self._event_pipeline.close()
         self.settings.update({
