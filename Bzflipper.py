@@ -8,9 +8,11 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import traceback
 import webbrowser
 import zipfile
 from tkinter import ttk, messagebox, colorchooser
+
 
 import requests
 
@@ -57,7 +59,7 @@ MIN_AUTO_REFRESH_MINUTES = 1  # floor - avoids hammering Hypixel's API if
 # downloadable asset - a bare tag or commit wouldn't give the user
 # anything to click through to.
 #
-APP_VERSION = "1.1.0"  # bump this string with each GitHub release you publish
+APP_VERSION = "1.1.2"  # bump this string with each GitHub release you publish
 GITHUB_REPO = "Lexiixell/Bazaarflipper"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -231,6 +233,102 @@ def jerry_workshop_status(now=None):
     }
 
 
+def harvest_festival_status(now=None, mayor_info=None):
+    """Whether the Harvest Festival is currently active. Calendar-gated:
+    runs during Early Autumn, Autumn, Late Autumn every SkyBlock year.
+    If Finnegan is mayor and has the Grand Feast perk, it lasts the
+    ENTIRE SkyBlock year instead of just autumn."""
+    if now is None:
+        now = time.time()
+    year, month_index, month_name, day = get_skyblock_date(now)
+
+    finnegan_extends = False
+    if mayor_info and mayor_info.get("name") == "Finnegan":
+        perks = mayor_info.get("perks") or []
+        if HARVEST_FESTIVAL_FINNEGAN_PERK in perks:
+            finnegan_extends = True
+    # Minister can also carry the perk
+    if mayor_info and mayor_info.get("minister_perk") == HARVEST_FESTIVAL_FINNEGAN_PERK:
+        finnegan_extends = True
+
+    calendar_active = month_index in HARVEST_FESTIVAL_MONTH_INDICES
+    active = finnegan_extends or calendar_active
+
+    reasons = []
+    if calendar_active:
+        reasons.append(f"SkyBlock {month_name} (Year {year}, day {day})")
+    if finnegan_extends and not calendar_active:
+        reasons.append("Finnegan's Grand Feast extends Harvest Festival year-round")
+
+    return {
+        "active": active,
+        "reasons": reasons,
+        "finnegan_extended": finnegan_extends,
+        "skyblock_year": year,
+        "skyblock_month": month_name,
+        "skyblock_day": day,
+    }
+
+
+def oringo_status(now=None):
+    """Whether Oringo's Traveling Zoo is currently visiting, and which
+    legendary pet is available (computed from the fixed rotation cycle).
+    The pet index is auto-calculated but can be overridden by the user
+    in Settings if the computed rotation has drifted."""
+    if now is None:
+        now = time.time()
+    elapsed = now - ORINGO_EPOCH_SECONDS
+    cycle_position = elapsed % ORINGO_CYCLE_SECONDS
+    active = cycle_position < ORINGO_VISIT_SECONDS
+
+    # Which visit number is this (or the most recent one)?
+    visit_number = int(elapsed // ORINGO_CYCLE_SECONDS)
+    pet_index = visit_number % len(ORINGO_LEGENDARY_ROTATION)
+    current_pet = ORINGO_LEGENDARY_ROTATION[pet_index]
+
+    # Time until next visit (if not active now)
+    if active:
+        time_remaining = ORINGO_VISIT_SECONDS - cycle_position
+    else:
+        time_remaining = ORINGO_CYCLE_SECONDS - cycle_position
+
+    return {
+        "active": active,
+        "current_pet": current_pet,
+        "pet_index": pet_index,
+        "visit_number": visit_number,
+        "time_remaining_seconds": int(time_remaining),
+        "pet_materials": ORINGO_PET_MATERIALS.get(current_pet, []),
+    }
+
+
+def year_of_pig_status(now=None):
+    """Whether it's currently the Year of the Pig in SkyBlock. Occurs
+    once every 12 SkyBlock years (~62 real days)."""
+    if now is None:
+        now = time.time()
+    year, month_index, month_name, day = get_skyblock_date(now)
+    is_pig_year = (year % YEAR_OF_PIG_CYCLE) == YEAR_OF_PIG_OFFSET
+
+    # Next pig year
+    if is_pig_year:
+        next_pig_year = year + YEAR_OF_PIG_CYCLE
+    else:
+        remainder = year % YEAR_OF_PIG_CYCLE
+        if YEAR_OF_PIG_OFFSET > remainder:
+            next_pig_year = year + (YEAR_OF_PIG_OFFSET - remainder)
+        else:
+            next_pig_year = year + (YEAR_OF_PIG_CYCLE - remainder + YEAR_OF_PIG_OFFSET)
+
+    return {
+        "active": is_pig_year,
+        "skyblock_year": year,
+        "skyblock_month": month_name,
+        "skyblock_day": day,
+        "next_pig_year": next_pig_year,
+    }
+
+
 # ---- Mayor / election API + seasonal event windows -----------------------
 # Hypixel's election endpoint returns the CURRENTLY ELECTED mayor plus
 # their minister (a second candidate who lost the mayoral race but still
@@ -246,6 +344,7 @@ FESTIVAL_PERK_EVENTS = {
     "Fishing Festival": "fishing_festival",        # Marina
     "Mining Fiesta": "mining_fiesta",               # Cole
     "Mythological Ritual": "mythological_ritual",   # Diana
+    "Grand Feast": "harvest_festival",              # Finnegan (extends to full year)
 }
 # Paul's signature perk: 20% off dungeon-related NPC costs. Doesn't touch
 # bazaar order prices directly, but several bazaar-tradeable dungeon-drop
@@ -267,6 +366,42 @@ PAUL_DUNGEON_DISCOUNT_PCT = 20.0
 FISHING_FESTIVAL_DAYS = (1, 3)
 MINING_FIESTA_DAYS = (1, 7)
 MINING_FIESTA_MONTH_INDICES = {4, 5, 6, 7, 8}  # Summer .. Late Autumn
+
+# ---- Harvest Festival (calendar-gated, Finnegan-extendable) ---------
+# Runs every SkyBlock year during the autumn months. If Finnegan is mayor
+# and has the Grand Feast perk, it lasts the ENTIRE SkyBlock year instead.
+HARVEST_FESTIVAL_MONTH_INDICES = {6, 7, 8}  # Early Autumn, Autumn, Late Autumn
+HARVEST_FESTIVAL_FINNEGAN_PERK = "Grand Feast"
+
+# ---- Oringo / Traveling Zoo -----------------------------------------
+# Oringo appears every 2 real days and 2 hours (50 hours). The legendary
+# pet rotates through a fixed 6-pet cycle each visit.
+ORINGO_CYCLE_SECONDS = 50 * 3600          # 180,000 seconds between visits
+ORINGO_VISIT_SECONDS = 3600               # stays for ~1 real hour
+# Reference epoch: a known Oringo appearance. Adjust if the computed
+# rotation drifts from what you see in-game.
+ORINGO_EPOCH_SECONDS = 1560275700 + 3600  # ~1h after SB epoch
+ORINGO_LEGENDARY_ROTATION = [
+    "Blue Whale", "Tiger", "Lion", "Monkey", "Elephant", "Giraffe",
+]
+# Bazaar materials associated with each legendary pet (items whose demand
+# shifts when that pet is available from Oringo). Indexed by pet name.
+ORINGO_PET_MATERIALS = {
+    "Blue Whale": ["ENCHANTED_RAW_FISH", "ENCHANTED_INK_SAC", "ENCHANTED_PRISMARINE_SHARD"],
+    "Tiger":      ["ENCHANTED_RAW_BEEF", "ENCHANTED_BLAZE_ROD"],
+    "Lion":       ["ENCHANTED_GOLD_BLOCK", "ENCHANTED_GRILLED_PORK"],
+    "Monkey":     ["ENCHANTED_JUNGLE_LOG", "ENCHANTED_COOKIE"],
+    "Elephant":   ["ENCHANTED_IRON_BLOCK", "ENCHANTED_HAY_BALE"],
+    "Giraffe":    ["ENCHANTED_ACACIA_LOG", "ENCHANTED_CACTUS"],
+}
+
+# ---- Year of the Pig ------------------------------------------------
+# Occurs once every 12 SkyBlock years (the 12th animal in the zodiac
+# cycle). Lasts for the entire SkyBlock year when it fires.
+YEAR_OF_PIG_CYCLE = 12
+# Which position in the 12-year cycle is "Pig" (0-indexed).
+# year % 12 == this value means it's Year of the Pig.
+YEAR_OF_PIG_OFFSET = 0  # SB years 12, 24, 36, ...
 
 
 def fetch_mayor_info():
@@ -375,7 +510,7 @@ EVENT_ITEM_KEYWORDS = {
     "mining_fiesta": ["REFINED_MINERAL", "GLOSSY_GEMSTONE"],
     "fishing_festival": ["SHARK"],
     "mythological_ritual": ["ANCIENT_CLAW", "MINOS", "HARPY", "DAEDALUS", "MINOAUR", "CREATAN_BULL", "SPHINX" "ENCHANTMENT_ULTIMATE_CHIMERA"],
-    "jerry_workshop": ["GIFT", "HUNK_OF_BLUE_ICE", "HUNK_OF_ICE", "ENCHANTMENT_PROSPERITY", "WALNUT",],
+    "jerry_workshop": ["WHITE_GIFT","GREEN_GIFT","RED_GIFT", "HUNK_OF_BLUE_ICE", "HUNK_OF_ICE", "ENCHANTMENT_PROSPERITY", "WALNUT",],
     "spooky_festival": ["CANDY_CORN", "PURPLE_CANDY", "GREEN_CANDY",
                          "ECTOPLASM", "PUMPKING_GUTS", "SPOOKY_FRAGMENT", "WEREWOLF_SKIN",
                          "SOUL_FRAGMENT"],
@@ -383,7 +518,21 @@ EVENT_ITEM_KEYWORDS = {
                         "FUMING_POTATO_BOOK", "HOT_POTATO_BOOK", "PRECURSOR_GEAR",
                         "IMPLOSION_SCROLL", "SHADOW_WARP_SCROLL", "WITHER_SHIELD_SCROLL"
                         "FIRST_MASTER_STAR","SECOND_MASTER_STAR","THIRD_MASTER_STAR","FOURTH_MASTER_STAR","FIFTH_MASTER_STAR",],
+    "harvest_festival": ["CORNUCOPIA", "CARROT_ZEST", "DEEPFRIES", "AGGOURDIAN",
+                          "CANE_KNOT", "MELON_JUICE", "CACTUS_FLOWER",
+                          "DESIGNER_COFFEE_BEANS", "FEASTFUNGUS", "BOTROOT",
+                          "SALTED_SUNFLOWER_SEEDS", "CRYSTALIZED_MOONLIGHT",
+                          "FLORAL_GELATIN"],
+    "oringo": ["ENCHANTED_RAW_FISH", "ENCHANTED_INK_SAC", "ENCHANTED_PRISMARINE_SHARD",
+                "ENCHANTED_RAW_BEEF", "ENCHANTED_BLAZE_ROD",
+                "ENCHANTED_GOLD_BLOCK", "ENCHANTED_GRILLED_PORK",
+                "ENCHANTED_JUNGLE_LOG", "ENCHANTED_COOKIE",
+                "ENCHANTED_IRON_BLOCK", "ENCHANTED_HAY_BALE",
+                "ENCHANTED_ACACIA_LOG", "ENCHANTED_CACTUS"],
+    "year_of_pig": ["FARMING_FOR_DUMMIES", "ENCHANTMENT_HARVESTING",
+                     "POTATO_SPREADING"],
 }
+
 
 
 def tag_event_relevance(product_id):
@@ -460,6 +609,14 @@ MAYOR_CACHE_PATH = os.path.join(APP_DATA_DIR, "mayor_cache.json")  # last-known 
     # endpoint from the bazaar, and can fail independently) falls back to
     # the last thing we successfully saw instead of blanking out every
     # event badge in the app.
+STORAGE_PATH = os.path.join(APP_DATA_DIR, "storage.json")  # user's saved/pinned
+    # flips + manual entries - see the Storage tab. Lives in the same
+    # per-user APPDATA/AppSupport/XDG folder as every other *_PATH above,
+    # which is what makes it (and everything else in this file) survive a
+    # GitHub-release update: _apply_update()/robocopy only ever mirrors
+    # files into the INSTALL folder (next to the .exe), and never touches
+    # APP_DATA_DIR at all, so anything saved here is untouched by an
+    # update no matter how the install folder's contents change.
 
 
 def load_json(path, default):
@@ -594,6 +751,9 @@ EVENT_BADGE_STYLE = {
     "jerry_workshop":      ("\u2744 Jerry's Workshop", ACCENT_BLUE),
     "spooky_festival":     ("\U0001F383 Spooky Festival", ACCENT_YELLOW),
     "dungeon_supply":      ("\u2694 Paul -20% Chests", ACCENT_RED),
+    "harvest_festival":    ("\U0001F33E Harvest Festival", ACCENT_GREEN),
+    "oringo":              ("\U0001F981 Traveling Zoo", ACCENT_YELLOW),
+    "year_of_pig":         ("\U0001F437 Year of the Pig", ACCENT_RED),
 }
 
 SORT_OPTIONS = [
@@ -606,6 +766,12 @@ SORT_OPTIONS = [
     ("Item",                "item"),
     ("Category",             "category"),
     ("Weekly Sales",       "weekly_volume")
+]
+EVENT_ENGINE_SORT_OPTIONS = [
+    ("Confidence", "confidence"),
+    ("Expected movement", "movement"),
+    ("Item", "item"),
+    ("Recommendation", "action"),
 ]
 
 
@@ -1144,13 +1310,14 @@ class FlipCard(tk.Frame):
     """A collapsible box for one item. Header shows name/category/quick
     number; tapping it expands a detail grid with every field inside."""
     def __init__(self, parent, flip, mode, on_set_category, sleep_hours=None, on_blacklist=None,
-                 market_context=None):
+                 market_context=None, on_add_storage=None):
         super().__init__(parent, bg=BORDER_SUBTLE)
         self.flip = flip
         self.mode = mode
         self.expanded = False
         self.on_set_category = on_set_category
         self.on_blacklist = on_blacklist
+        self.on_add_storage = on_add_storage
         # market_context carries {"active_event_keys": set(...),
         # "paul_discount_active": bool} so the card can badge itself
         # against what's ACTUALLY live right now, not just what keywords
@@ -1322,6 +1489,13 @@ class FlipCard(tk.Frame):
                                  command=lambda: self.on_set_category(flip["id"]))
         set_cat_btn.pack(side="left")
         hoverable(set_cat_btn, BG_INPUT, ACCENT_SOFT)
+
+        if self.on_add_storage:
+            storage_btn = tk.Button(btn_row, text="\U0001F4E6 Add to Storage", font=FONT_PILL, bg=BG_INPUT,
+                                     fg=ACCENT, relief="flat", bd=0, padx=9, pady=4, cursor="hand2",
+                                     command=lambda: self.on_add_storage(flip))
+            storage_btn.pack(side="left", padx=(8, 0))
+            hoverable(storage_btn, BG_INPUT, ACCENT_SOFT)
 
         if self.on_blacklist:
             bl_btn = tk.Button(btn_row, text="Blacklist Item", font=FONT_PILL, bg=BG_INPUT,
@@ -1601,6 +1775,28 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(interval_row, text=f"minute(s)  (minimum {MIN_AUTO_REFRESH_MINUTES})", font=FONT_MAIN,
                  bg=BG_PANEL, fg=TEXT_MAIN).pack(side="left")
 
+        # --- Oringo Pet Override ---
+        self._section(outer, "Oringo (Traveling Zoo)")
+        oringo_frame = tk.Frame(outer, bg=BG_PANEL)
+        oringo_frame.pack(fill="x", pady=(0, 14))
+        tk.Label(oringo_frame, text="The legendary pet is auto-calculated from the rotation cycle. "
+                 "Override here if the auto-detection has drifted from what you see in-game.",
+                 font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_DIM, wraplength=420,
+                 justify="left").pack(anchor="w", pady=(0, 6))
+        pet_row = tk.Frame(oringo_frame, bg=BG_PANEL)
+        pet_row.pack(fill="x", pady=2)
+        tk.Label(pet_row, text="Current pet:", font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_DIM,
+                 width=16, anchor="w").pack(side="left")
+        self.oringo_pet_var = tk.StringVar(
+            value=app.settings.get("oringo_pet_override", "Auto"))
+        pet_values = ["Auto"] + ORINGO_LEGENDARY_ROTATION
+        ttk.Combobox(pet_row, textvariable=self.oringo_pet_var, state="readonly",
+                     values=pet_values, width=16).pack(side="left")
+        # Show what auto-detection thinks right now
+        auto_pet = getattr(app, "oringo_status_info", {}).get("current_pet", "?")
+        tk.Label(oringo_frame, text=f"Auto-detected: {auto_pet}", font=FONT_MAIN,
+                 bg=BG_PANEL, fg=TEXT_FAINT).pack(anchor="w", pady=(2, 0))
+
         # --- Blacklist ---
         self._section(outer, "Blacklisted Items")
         bl = tk.Frame(outer, bg=BG_PANEL)
@@ -1712,6 +1908,10 @@ class SettingsDialog(tk.Toplevel):
         self.app.blacklist = blacklist_ids
         save_json(BLACKLIST_PATH, sorted(blacklist_ids))
 
+        # Oringo pet override
+        pet_choice = self.oringo_pet_var.get() if hasattr(self, "oringo_pet_var") else "Auto"
+        self.app.settings["oringo_pet_override"] = pet_choice
+
         self.app.settings.update({
             "accent_color": self.accent_var.get(),
             "auto_refresh_enabled": self.app.auto_refresh_enabled,
@@ -1722,6 +1922,465 @@ class SettingsDialog(tk.Toplevel):
         self.app._schedule_auto_refresh()
         self.app.recompute_and_render()
         self.destroy()
+
+
+class ManualStorageDialog(tk.Toplevel):
+    """Modal for adding a hand-typed entry to Storage - for items you want
+    to track that didn't come from an existing flip card (e.g. something
+    you spotted in-game, or a price you want to keep an eye on). Buy/Sell
+    price are optional; profit/margin are only computed when both are
+    given, otherwise the entry is stored as a plain note."""
+    def __init__(self, parent, existing_categories, on_add):
+        super().__init__(parent)
+        self.title("Add Item to Storage")
+        self.configure(bg=BG_PANEL)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.on_add = on_add
+
+        pad = {"padx": 18, "pady": 6}
+
+        tk.Frame(self, bg=ACCENT, height=3).pack(fill="x")
+        tk.Label(self, text="Add Item to Storage", font=FONT_HEAD, bg=BG_PANEL, fg=ACCENT).pack(
+            anchor="w", padx=18, pady=(12, 6))
+        tk.Label(self, text="Manually track any item, price, or note - not just flips already "
+                             "found by the scanner.", font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_DIM,
+                 wraplength=360, justify="left").pack(anchor="w", padx=18, pady=(0, 8))
+
+        form = tk.Frame(self, bg=BG_PANEL)
+        form.pack(fill="x", padx=18)
+
+        self.name_var = tk.StringVar()
+        self.category_var = tk.StringVar(value="Manual")
+        self.buy_var = tk.StringVar()
+        self.sell_var = tk.StringVar()
+        self.qty_var = tk.StringVar(value="1")
+        self.notes_var = tk.StringVar()
+
+        def row(label, var, values=None, width=26):
+            r = tk.Frame(form, bg=BG_PANEL)
+            r.pack(fill="x", pady=4)
+            tk.Label(r, text=label, font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_DIM,
+                     width=14, anchor="w").pack(side="left")
+            if values is not None:
+                widget = ttk.Combobox(r, textvariable=var, values=values, width=width - 3)
+            else:
+                widget = ttk.Entry(r, textvariable=var, width=width)
+            widget.pack(side="left")
+            return widget
+
+        name_entry = row("Item Name:", self.name_var)
+        row("Category:", self.category_var, values=sorted(existing_categories))
+        row("Buy Price:", self.buy_var)
+        row("Sell Price:", self.sell_var)
+        row("Quantity:", self.qty_var)
+        row("Notes:", self.notes_var)
+
+        tk.Label(self, text="Buy/Sell price are optional - leave blank for a plain note.",
+                 font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_FAINT).pack(anchor="w", padx=18, pady=(4, 0))
+
+        name_entry.focus_set()
+
+        btn_row = tk.Frame(self, bg=BG_PANEL)
+        btn_row.pack(pady=(14, 16), padx=18, fill="x")
+
+        def do_add():
+            name = self.name_var.get().strip()
+            if not name:
+                messagebox.showwarning("Missing name", "Enter an item name.", parent=self)
+                return
+
+            def parse_optional_float(s):
+                s = s.strip().replace(",", "")
+                if not s:
+                    return None
+                try:
+                    return float(s)
+                except ValueError:
+                    return None
+
+            buy = parse_optional_float(self.buy_var.get())
+            sell = parse_optional_float(self.sell_var.get())
+            try:
+                qty = max(1, int(float(self.qty_var.get().strip() or "1")))
+            except ValueError:
+                qty = 1
+
+            self.on_add({
+                "item": name,
+                "category": self.category_var.get().strip() or "Manual",
+                "buy_at": buy,
+                "sell_at": sell,
+                "quantity": qty,
+                "notes": self.notes_var.get().strip(),
+            })
+            self.destroy()
+
+        ttk.Button(btn_row, text="Add", command=do_add).pack(side="left")
+        ttk.Button(btn_row, text="Cancel", style="Secondary.TButton", command=self.destroy).pack(side="right")
+
+
+class StorageCard(tk.Frame):
+    """A collapsible box for one saved Storage entry - either pulled in
+    from a live flip (source == 'flip') or hand-typed (source ==
+    'manual'). Mirrors FlipCard's look/collapse behavior so Storage feels
+    like part of the same app, but its fields come from the stored entry
+    dict itself rather than a live bazaar snapshot."""
+    def __init__(self, parent, entry, on_remove):
+        super().__init__(parent, bg=BORDER_SUBTLE)
+        self.entry = entry
+        self.expanded = False
+        self.detail = None
+        self.on_remove = on_remove
+
+        inner = tk.Frame(self, bg=BG_PANEL)
+        inner.pack(fill="both", expand=True)
+
+        stripe_color = ACCENT if entry.get("source") == "manual" else chip_color(entry.get("category") or "Manual")
+        tk.Frame(inner, bg=stripe_color, width=4).pack(side="left", fill="y")
+
+        body_wrap = tk.Frame(inner, bg=BG_PANEL)
+        body_wrap.pack(side="left", fill="both", expand=True)
+
+        header = tk.Frame(body_wrap, bg=BG_PANEL, cursor="hand2")
+        header.pack(fill="x")
+
+        name_text = entry.get("item", "Unknown Item")
+        name_lbl = tk.Label(header, text=name_text, font=FONT_SUBHEAD, bg=BG_PANEL, fg=TEXT_MAIN)
+        name_lbl.pack(side="left", padx=(10, 0), pady=5)
+
+        cat_lbl = tk.Label(header, text=entry.get("category") or "Manual", font=FONT_PILL,
+                            bg=BG_PANEL, fg=TEXT_DIM)
+        cat_lbl.pack(side="left", padx=(8, 0), pady=5)
+
+        source_text = "\u270e Manual" if entry.get("source") == "manual" else "\U0001F517 From Flip"
+        source_lbl = tk.Label(header, text=source_text, font=FONT_PILL, bg=BG_PANEL, fg=TEXT_FAINT)
+        source_lbl.pack(side="left", padx=(8, 0), pady=5)
+
+        self.arrow_lbl = tk.Label(header, text="\u25b6", font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_FAINT)
+        self.arrow_lbl.pack(side="right", padx=(0, 10), pady=5)
+
+        margin = entry.get("margin")
+        if margin is not None:
+            quick_text = f"{margin:.1f}% margin \u00b7 {fmt_num(entry.get('profit') or 0)}/item"
+            quick_color = ACCENT_GREEN if margin >= 50 else ACCENT_YELLOW if margin >= 15 else TEXT_DIM
+        else:
+            quick_text = "note"
+            quick_color = TEXT_DIM
+        quick_lbl = tk.Label(header, text=quick_text, font=FONT_MAIN, bg=BG_PANEL, fg=quick_color)
+        quick_lbl.pack(side="right", padx=(0, 10), pady=5)
+
+        toggle_widgets = [header, name_lbl, cat_lbl, source_lbl, quick_lbl, self.arrow_lbl]
+        for w in toggle_widgets:
+            w.bind("<Button-1>", self.toggle)
+
+        def on_enter(_e):
+            for w in toggle_widgets:
+                w.configure(bg=BG_CARD_HOVER)
+
+        def on_leave(_e):
+            for w in toggle_widgets:
+                w.configure(bg=BG_PANEL)
+
+        header.bind("<Enter>", on_enter)
+        header.bind("<Leave>", on_leave)
+
+    def _build_detail(self):
+        entry = self.entry
+        rows = []
+        if entry.get("buy_at") is not None:
+            rows.append(("Buy At", fmt_num(entry["buy_at"])))
+        if entry.get("sell_at") is not None:
+            rows.append(("Sell At", fmt_num(entry["sell_at"])))
+        if entry.get("profit") is not None:
+            rows.append(("Profit/Item", fmt_num(entry["profit"])))
+        if entry.get("margin") is not None:
+            rows.append(("Margin %", f"{entry['margin']:.1f}%"))
+        rows.append(("Quantity", fmt_int(entry.get("quantity") or 1)))
+        if entry.get("added_ts"):
+            rows.append(("Added", time.strftime("%Y-%m-%d %H:%M", time.localtime(entry["added_ts"]))))
+
+        grid = tk.Frame(self.detail, bg=BG_PANEL_RAISED)
+        grid.pack(fill="x", padx=16, pady=(8, 2))
+        for i, (label, text) in enumerate(rows):
+            r, c = divmod(i, 2)
+            cell = tk.Frame(grid, bg=BG_PANEL_RAISED)
+            cell.grid(row=r, column=c, sticky="w", padx=(0, 28), pady=2)
+            tk.Label(cell, text=label + ":", font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=TEXT_DIM).pack(side="left")
+            tk.Label(cell, text=" " + text, font=FONT_BOLD, bg=BG_PANEL_RAISED, fg=TEXT_MAIN).pack(side="left")
+
+        if entry.get("notes"):
+            tk.Label(self.detail, text="Notes: " + entry["notes"], font=FONT_MAIN, bg=BG_PANEL_RAISED,
+                     fg=TEXT_DIM, wraplength=900, justify="left").pack(anchor="w", padx=16, pady=(2, 6))
+
+        btn_row = tk.Frame(self.detail, bg=BG_PANEL_RAISED)
+        btn_row.pack(anchor="w", padx=16, pady=(2, 12))
+        remove_btn = tk.Button(btn_row, text="Remove from Storage", font=FONT_PILL, bg=BG_INPUT,
+                                fg=ACCENT_RED, relief="flat", bd=0, padx=9, pady=4, cursor="hand2",
+                                command=lambda: self.on_remove(entry["entry_id"]))
+        remove_btn.pack(side="left")
+        hoverable(remove_btn, BG_INPUT, "#4a2a2a")
+
+    def toggle(self, _event=None):
+        self.expanded = not self.expanded
+        if self.expanded:
+            if self.detail is None:
+                self.detail = tk.Frame(self, bg=BG_PANEL_RAISED)
+                self.detail.pack(fill="x")
+                self._build_detail()
+            else:
+                self.detail.pack(fill="x")
+            self.arrow_lbl.configure(text="\u25bc")
+        else:
+            if self.detail is not None:
+                self.detail.pack_forget()
+            self.arrow_lbl.configure(text="\u25b6")
+
+
+class EventItemCard(tk.Frame):
+    """One item's event-driven Buy/Hold/Sell analysis, collapsible like
+    FlipCard. Displays exactly what the event_price_engine's Recommendation
+    (from scoring.py, produced via Pipeline.generate_recommendation) already
+    computed - this card only formats it, it never re-derives a score."""
+    def __init__(self, parent, item_id, recommendation):
+        super().__init__(parent, bg=BORDER_SUBTLE)
+        self.expanded = False
+        self.detail = None
+        self.rec = recommendation
+        self.item_id = item_id
+
+        inner = tk.Frame(self, bg=BG_PANEL)
+        inner.pack(fill="both", expand=True)
+
+        action = recommendation.action if recommendation else "hold"
+        action_color = {"buy": ACCENT_GREEN, "sell": ACCENT_RED,
+                        "hold": ACCENT_YELLOW}.get(action, TEXT_DIM)
+
+        stripe = tk.Frame(inner, bg=action_color, width=4)
+        stripe.pack(side="left", fill="y")
+
+        body = tk.Frame(inner, bg=BG_PANEL)
+        body.pack(side="left", fill="both", expand=True)
+
+        header = tk.Frame(body, bg=BG_PANEL, cursor="hand2")
+        header.pack(fill="x")
+
+        name_text = item_id.replace("_", " ").title()
+        name_lbl = tk.Label(header, text=name_text, font=FONT_SUBHEAD, bg=BG_PANEL, fg=TEXT_MAIN)
+        name_lbl.pack(side="left", padx=(10, 8), pady=6)
+
+        action_lbl = tk.Label(header, text=action.upper(), font=FONT_PILL, bg=BG_PANEL, fg=action_color)
+        action_lbl.pack(side="left", pady=6)
+
+        if recommendation:
+            if action == "buy":
+                conf = recommendation.buy_confidence
+            elif action == "sell":
+                conf = recommendation.sell_confidence
+            else:
+                conf = max(recommendation.buy_confidence, recommendation.sell_confidence)
+            quick_text = f"{conf:.0f}% confidence \u00b7 {recommendation.expected_appreciation:+.1f}% expected"
+            confidence_color = (ACCENT_GREEN if conf >= 75 else
+                                ACCENT_YELLOW if conf >= 50 else ACCENT_RED)
+        else:
+            quick_text = "insufficient data yet"
+            confidence_color = TEXT_FAINT
+        quick_lbl = tk.Label(header, text=quick_text, font=FONT_MAIN, bg=BG_PANEL, fg=confidence_color)
+        quick_lbl.pack(side="right", padx=(0, 10), pady=6)
+
+        self.arrow_lbl = tk.Label(header, text="\u25b6", font=FONT_MAIN, bg=BG_PANEL, fg=TEXT_FAINT)
+        self.arrow_lbl.pack(side="right", padx=(0, 6), pady=6)
+
+        toggle_widgets = [header, name_lbl, action_lbl, quick_lbl, self.arrow_lbl]
+        for w in toggle_widgets:
+            w.bind("<Button-1>", self.toggle)
+
+        def on_enter(_e):
+            for w in toggle_widgets:
+                w.configure(bg=BG_CARD_HOVER)
+
+        def on_leave(_e):
+            for w in toggle_widgets:
+                w.configure(bg=BG_PANEL)
+
+        header.bind("<Enter>", on_enter)
+        header.bind("<Leave>", on_leave)
+
+    def toggle(self, _event=None):
+        self.expanded = not self.expanded
+        if self.expanded:
+            if self.detail is None:
+                self.detail = tk.Frame(self, bg=BG_PANEL_RAISED)
+                self.detail.pack(fill="x")
+                self._build_detail()
+            else:
+                self.detail.pack(fill="x")
+            self.arrow_lbl.configure(text="\u25bc")
+        else:
+            if self.detail is not None:
+                self.detail.pack_forget()
+            self.arrow_lbl.configure(text="\u25b6")
+
+    def _build_detail(self):
+        rec = self.rec
+
+        if rec is None:
+            tk.Label(self.detail,
+                     text=("No current Buy/Hold/Sell recommendation yet - this needs at least one "
+                           "closed historical occurrence of this event (with price history recorded "
+                           "during it) plus current price data for this item. It fills in "
+                           "automatically as more real event occurrences pass."),
+                     font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=TEXT_DIM,
+                     wraplength=880, justify="left").pack(anchor="w", padx=16, pady=(10, 12))
+            return
+
+        try:
+            details = json.loads(rec.details_json)
+        except (TypeError, ValueError):
+            details = {}
+        buy_window = details.get("buy_window")
+        sell_window = details.get("sell_window")
+        anchor = details.get("anchor")
+        occurrences_used = details.get("occurrences_used")
+
+        grid = tk.Frame(self.detail, bg=BG_PANEL_RAISED)
+        grid.pack(fill="x", padx=16, pady=(10, 6))
+        rows = [
+            ("Recommendation", rec.action.upper()),
+            ("Buy Confidence", f"{rec.buy_confidence:.1f}%"),
+            ("Sell Confidence", f"{rec.sell_confidence:.1f}%"),
+            ("Expected Profit/Deviation", f"{rec.expected_appreciation:+.1f}%"),
+            ("Expected Holding Window", f"{rec.expected_holding_days:.1f} day(s)"),
+        ]
+        if buy_window:
+            rows.append(("Best Historical Buy Window",
+                          f"Day {buy_window[0]} to Day {buy_window[1]} "
+                          f"(relative to event {anchor or 'start'})"))
+        if sell_window:
+            rows.append(("Best Historical Sell Window",
+                          f"Day {sell_window[0]} to Day {sell_window[1]} "
+                          f"(relative to event {anchor or 'start'})"))
+        if occurrences_used is not None:
+            rows.append(("Historical Occurrences Used", str(occurrences_used)))
+
+        for i, (label, text) in enumerate(rows):
+            r, c = divmod(i, 2)
+            cell = tk.Frame(grid, bg=BG_PANEL_RAISED)
+            cell.grid(row=r, column=c, sticky="w", padx=(0, 28), pady=2)
+            tk.Label(cell, text=label + ":", font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=TEXT_DIM).pack(side="left")
+            tk.Label(cell, text=" " + text, font=FONT_BOLD, bg=BG_PANEL_RAISED, fg=TEXT_MAIN).pack(side="left")
+
+        if rec.explanation:
+            tk.Label(self.detail, text="Historical Trend, Supporting Indicators & Reasoning:",
+                     font=FONT_SUBHEAD, bg=BG_PANEL_RAISED, fg=TEXT_MAIN).pack(
+                anchor="w", padx=16, pady=(8, 2))
+            reasoning_text = "\n".join(f"\u2022 {line}" for line in rec.explanation)
+            tk.Label(self.detail, text=reasoning_text, font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=TEXT_DIM,
+                     wraplength=880, justify="left").pack(anchor="w", padx=16, pady=(0, 12))
+
+
+class LegacyEventRecommendationsView:
+    """Browsable, per-event breakdown of the event-driven price-deviation
+    analysis engine (event_price_engine): historical price trend, current
+    Buy/Hold/Sell call, confidence score, expected profit/deviation, best
+    historical buy/sell windows, and the indicators behind each call.
+
+    This dialog does NOT compute any of that itself - it only calls the
+    existing Pipeline/Database facade (event_price_engine) and formats
+    what comes back, so there's exactly one copy of the scoring logic
+    (scoring.py / indicators.py / event_study.py), same as bazaar_bridge.py
+    already does for feeding data in. One dedicated, collapsible section
+    per tracked seasonal event, so multiple events are easy to browse and
+    compare side by side."""
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Event-Driven Price Recommendations")
+        self.configure(bg=BG_DARK)
+        self.geometry("1000x640")
+        self.minsize(760, 420)
+        self.transient(app)
+
+        tk.Frame(self, bg=ACCENT, height=3).pack(fill="x")
+        header = tk.Frame(self, bg=BG_DARK)
+        header.pack(fill="x", padx=18, pady=(14, 6))
+        tk.Label(header, text="\U0001F4C8 Event-Driven Price Recommendations", font=FONT_HEAD,
+                 bg=BG_DARK, fg=ACCENT).pack(side="left")
+        refresh_btn = tk.Button(header, text="\u21bb Refresh", font=FONT_PILL, bg=BG_INPUT,
+                                 fg=TEXT_MAIN, relief="flat", bd=0, padx=10, pady=5, cursor="hand2",
+                                 command=self._reload)
+        refresh_btn.pack(side="right")
+        hoverable(refresh_btn, BG_INPUT, ACCENT_SOFT)
+
+        self.status_var = tk.StringVar(value="Loading event analysis...")
+        tk.Label(self, textvariable=self.status_var, font=FONT_MAIN, bg=BG_DARK, fg=TEXT_DIM,
+                 wraplength=960, justify="left").pack(anchor="w", padx=18, pady=(0, 8))
+
+        self.scroll = VerticalScrollFrame(self, bg=BG_DARK)
+        self.scroll.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        self.after(50, self._reload)
+
+    def _reload(self):
+        self.status_var.set("Loading event analysis...")
+        for child in self.scroll.inner.winfo_children():
+            child.destroy()
+        try:
+            sections = self.app._gather_event_sections()
+        except Exception as exc:
+            self.status_var.set(f"Couldn't load event analysis: {exc}")
+            return
+
+        if not sections:
+            self.status_var.set(
+                "No seasonal events have been recorded yet. This fills in automatically as Mining "
+                "Fiesta, Fishing Festival, Mythological Ritual, or Jerry's Workshop actually occur "
+                "while the app is running - check back after the next one starts (or has run at "
+                "least once since you started using this build).")
+            return
+
+        self.status_var.set(f"{len(sections)} tracked event type(s). Tap any item for its full breakdown.")
+        for section in sections:
+            self._render_section(section)
+
+    def _render_section(self, section):
+        event_type = section["event_type"]
+        label, color = EVENT_BADGE_STYLE.get(event_type, (event_type, ACCENT))
+        current = section["current_instance"]
+
+        start_txt = time.strftime("%Y-%m-%d %H:%M", time.localtime(current.start_ts))
+        if current.end_ts:
+            end_txt = time.strftime("%Y-%m-%d %H:%M", time.localtime(current.end_ts))
+            timeframe = f"{start_txt} \u2192 {end_txt} (ended)"
+        else:
+            timeframe = f"{start_txt} \u2192 ongoing"
+
+        wrap = tk.Frame(self.scroll.inner, bg=BG_DARK)
+        wrap.pack(fill="x", pady=(4, 10))
+
+        head_row = tk.Frame(wrap, bg=BG_DARK)
+        head_row.pack(fill="x")
+        tk.Frame(head_row, bg=color, width=4, height=22).pack(side="left", padx=(0, 8))
+        tk.Label(head_row, text=label, font=FONT_TITLE, bg=BG_DARK, fg=color).pack(side="left")
+        tk.Label(head_row, text=f"   Most recent occurrence: {timeframe}", font=FONT_MAIN,
+                 bg=BG_DARK, fg=TEXT_DIM).pack(side="left")
+        tk.Label(head_row, text=f"{section['historical_count']} prior occurrence(s) on record",
+                 font=FONT_MAIN, bg=BG_DARK, fg=TEXT_FAINT).pack(side="right", padx=10, pady=9)
+
+        if not section["items"]:
+            tk.Label(wrap, text="No items with a current Buy/Hold/Sell recommendation for this "
+                                 "event yet (needs at least one closed prior occurrence to compare "
+                                 "against).",
+                     font=FONT_MAIN, bg=BG_DARK, fg=TEXT_FAINT, wraplength=940,
+                     justify="left").pack(anchor="w", pady=(6, 0))
+            return
+
+        cards_frame = tk.Frame(wrap, bg=BG_DARK)
+        cards_frame.pack(fill="x", pady=(6, 0))
+        for row in section["items"]:
+            card = EventItemCard(cards_frame, row["item_id"], row["recommendation"])
+            card.pack(fill="x", pady=1)
 
 
 class BazaarFlipperApp(tk.Tk):
@@ -1739,6 +2398,9 @@ class BazaarFlipperApp(tk.Tk):
         self.custom_categories = set(load_json(CUSTOM_CATEGORIES_PATH, []))
         self.price_history = load_price_history()
         self.blacklist = set(load_json(BLACKLIST_PATH, []))
+        self.storage = load_json(STORAGE_PATH, [])
+        self._event_pipeline = None
+        self._data_ready = False
 
         # Mayor/election context - seeded from the last-known cache so the
         # UI has *something* to show before the first live election fetch
@@ -1748,6 +2410,9 @@ class BazaarFlipperApp(tk.Tk):
         self.active_festivals = compute_active_festivals(self.mayor_info)
         self.paul_discount_active = paul_dungeon_discount_active(self.mayor_info)
         self.jerry_status = jerry_workshop_status()
+        self.harvest_status = harvest_festival_status(mayor_info=self.mayor_info)
+        self.oringo_status_info = oringo_status()
+        self.year_of_pig_status_info = year_of_pig_status()
         self._recompute_active_event_keys()
 
         self.auto_refresh_enabled = bool(self.settings.get("auto_refresh_enabled", DEFAULT_AUTO_REFRESH_ENABLED))
@@ -1760,7 +2425,9 @@ class BazaarFlipperApp(tk.Tk):
 
         self.sort_key = "profit_hr"
         self.sort_reverse = True
-        self.view_mode = "dashboard"      # "dashboard" (Overnight Plan) or "full"
+        self.event_sort_key = "confidence"
+        self.event_sort_reverse = True
+        self.view_mode = "dashboard"      # dashboard, full, event_engine, or storage
         self.category_var = tk.StringVar(value=ALL_CATEGORIES)
         self.category_buttons = {}
 
@@ -1857,6 +2524,9 @@ class BazaarFlipperApp(tk.Tk):
         ttk.Button(top_bar, text="\U0001F3F7 Manage Categories", style="Secondary.TButton",
                    command=self.open_manage_categories).pack(side="left", padx=(10, 0))
 
+        ttk.Button(top_bar, text="\U0001F4E6 + Add to Storage", style="Secondary.TButton",
+                   command=self.open_manual_storage_dialog).pack(side="left", padx=(10, 0))
+
         view_frame = ttk.Frame(top_bar, style="TopBar.TFrame")
         view_frame.pack(side="right")
         self.dashboard_btn = ttk.Button(view_frame, text="\U0001F319 Overnight Plan",
@@ -1865,8 +2535,14 @@ class BazaarFlipperApp(tk.Tk):
         self.fulllist_btn = ttk.Button(view_frame, text="\u2261 Full List",
                                         command=lambda: self.set_view("full"))
         self.fulllist_btn.pack(side="left")
+        self.event_engine_btn = ttk.Button(view_frame, text="\U0001F4C8 Event Engine",
+                                            command=lambda: self.set_view("event_engine"))
+        self.event_engine_btn.pack(side="left", padx=(4, 0))
+        self.storage_btn = ttk.Button(view_frame, text="\U0001F4E6 Storage",
+                                       command=lambda: self.set_view("storage"))
+        self.storage_btn.pack(side="left", padx=(4, 0))
 
-        # Row 2: search + sort (Full List) / category pills - only shown in Full List view
+        # Row 2: shared search/filter controls for the browsable views.
         self.category_bar_wrap = ttk.Frame(self, padding=(14, 10, 14, 6))
 
         filter_row = ttk.Frame(self.category_bar_wrap)
@@ -1877,12 +2553,13 @@ class BazaarFlipperApp(tk.Tk):
         search_entry.pack(side="left")
         search_entry.bind("<KeyRelease>", lambda e: self._on_search_key())
 
-        ttk.Label(filter_row, text="Sort by:").pack(side="left", padx=(16, 6))
+        self.sort_label = ttk.Label(filter_row, text="Sort by:")
+        self.sort_label.pack(side="left", padx=(16, 6))
         self.sort_var = tk.StringVar(value=SORT_OPTIONS[0][0])
-        sort_combo = ttk.Combobox(filter_row, textvariable=self.sort_var, state="readonly",
-                                   values=[label for label, _ in SORT_OPTIONS], width=20)
-        sort_combo.pack(side="left")
-        sort_combo.bind("<<ComboboxSelected>>", lambda e: self._on_sort_change())
+        self.sort_var_combo = ttk.Combobox(filter_row, textvariable=self.sort_var, state="readonly",
+                                            values=[label for label, _ in SORT_OPTIONS], width=20)
+        self.sort_var_combo.pack(side="left")
+        self.sort_var_combo.bind("<<ComboboxSelected>>", lambda e: self._on_sort_change())
 
         self.sort_dir_btn = ttk.Button(filter_row, text="\u25bc Desc", style="Secondary.TButton",
                                         command=self._toggle_sort_dir)
@@ -1896,7 +2573,8 @@ class BazaarFlipperApp(tk.Tk):
         # whatever event_tags actually show up in the current flip data
         # (see _rebuild_event_filter_options), so it never offers an
         # event with zero matching items.
-        ttk.Label(filter_row, text="Event:").pack(side="left", padx=(16, 6))
+        self.event_filter_label = ttk.Label(filter_row, text="Event:")
+        self.event_filter_label.pack(side="left", padx=(16, 6))
         self.event_filter_var = tk.StringVar(value=EVENT_FILTER_ALL)
         self.event_filter_combo = ttk.Combobox(filter_row, textvariable=self.event_filter_var,
                                                 state="readonly", values=[EVENT_FILTER_ALL], width=20)
@@ -1954,16 +2632,29 @@ class BazaarFlipperApp(tk.Tk):
     def set_view(self, mode):
         self.view_mode = mode
         self._refresh_view_buttons()
-        if mode == "full":
+        if mode in ("full", "event_engine"):
             self.category_bar_wrap.pack(fill="x", after=self.top_bar_wrap)
         else:
             self.category_bar_wrap.pack_forget()
+        is_event_engine = mode == "event_engine"
+        self.category_scroll.pack_forget() if is_event_engine else self.category_scroll.pack(fill="x")
+        self.event_filter_label.configure(text="Event type:" if is_event_engine else "Event:")
+        event_sort_options = EVENT_ENGINE_SORT_OPTIONS if is_event_engine else SORT_OPTIONS
+        current_key = self.event_sort_key if is_event_engine else self.sort_key
+        current_label = next((label for label, key in event_sort_options if key == current_key),
+                             event_sort_options[0][0])
+        self.sort_var.set(current_label)
+        self.sort_var_combo.configure(values=[label for label, _ in event_sort_options])
+        reverse = self.event_sort_reverse if is_event_engine else self.sort_reverse
+        self.sort_dir_btn.configure(text="\u25bc Desc" if reverse else "\u25b2 Asc")
         self._full_list_shown = self._full_list_page_size
         self.recompute_and_render()
 
     def _refresh_view_buttons(self):
         self.dashboard_btn.configure(style="ViewActive.TButton" if self.view_mode == "dashboard" else "View.TButton")
         self.fulllist_btn.configure(style="ViewActive.TButton" if self.view_mode == "full" else "View.TButton")
+        self.event_engine_btn.configure(style="ViewActive.TButton" if self.view_mode == "event_engine" else "View.TButton")
+        self.storage_btn.configure(style="ViewActive.TButton" if self.view_mode == "storage" else "View.TButton")
 
     def get_all_categories(self):
         """Union of categories currently in use by flips + custom ones the
@@ -2027,6 +2718,11 @@ class BazaarFlipperApp(tk.Tk):
         keys_present = set()
         for f in self.all_flips:
             keys_present.update(f.get("event_tags", []))
+        # The Event Engine can have history even when today's live bazaar
+        # tags do not include that event, so keep its event types filterable.
+        keys_present.update(key for key in EVENT_BADGE_STYLE if key != "dungeon_supply")
+        # Ensure new calendar-gated events are always filterable
+        keys_present.update(["harvest_festival", "oringo", "year_of_pig"])
 
         label_to_key = {}
         for key in keys_present:
@@ -2134,7 +2830,12 @@ class BazaarFlipperApp(tk.Tk):
 
         Only applies when running as the packaged .exe (sys.frozen). If
         you're running the raw .py file there's no installed folder to
-        replace, so this just falls back to opening the browser instead."""
+        replace, so this just falls back to opening the browser instead.
+
+        NOTE: this only ever touches the INSTALL folder next to the exe
+        (exe_dir below) - it never writes into APP_DATA_DIR, so
+        settings/blacklist/category overrides/price history/Storage all
+        survive an update untouched. See the STORAGE_PATH comment above."""
         if not getattr(sys, "frozen", False):
             webbrowser.open(self._update_release_url)
             return
@@ -2265,6 +2966,87 @@ class BazaarFlipperApp(tk.Tk):
             self._rebuild_category_bar()
         AddCategoryDialog(self, on_add)
 
+    # -- event-driven recommendations (event_price_engine) -----------------
+    def open_event_recommendations(self):
+        """Compatibility entry point for older menu bindings.
+
+        Event recommendations now live in the main Event Engine view rather
+        than opening a separate Toplevel window.
+        """
+        self.set_view("event_engine")
+
+    def _get_event_pipeline(self):
+        """Lazily builds (and caches) a Pipeline facade from event_price_engine,
+        pointed at the exact same sqlite DB bazaar_bridge.bridge_tick() has
+        already been writing to every refresh (self._event_price_db, set
+        there in _on_fetch_success) - reusing that already-resolved path
+        instead of re-deriving it, so this can never end up pointed at a
+        different DB file than the one actually being fed live data. Falls
+        back to the same default path bazaar_bridge would use if no refresh
+        has completed yet (e.g. dialog opened before the first fetch)."""
+        from event_price_engine import Pipeline, bazaar_bridge as _bridge
+
+        existing_db = getattr(self, "_event_price_db", None)
+        db_path = (existing_db.path if existing_db is not None
+                   else os.path.join(APP_DATA_DIR, _bridge.DB_FILENAME))
+
+        if self._event_pipeline is None or self._event_pipeline.db.path != db_path:
+            if self._event_pipeline is not None:
+                self._event_pipeline.close()
+            self._event_pipeline = Pipeline(db_path)
+        return self._event_pipeline
+
+    def _gather_event_sections(self):
+        """Builds the data displayed by the Event Engine, one
+        section per tracked seasonal event type. Calls only the existing
+        event_price_engine facade (Pipeline.generate_recommendation +
+        Database.load_event_instances/load_items_for_event_type) - all the
+        actual scoring/indicator/event-study logic still lives exactly
+        where it already did (scoring.py/indicators.py/event_study.py via
+        pipeline.py); this only assembles and returns it for display.
+
+        For each event type, the most recent recorded occurrence (open or
+        closed) is used as the anchor instance, and every prior occurrence
+        before it is what the recommendation is scored against - so a
+        currently-live event gets a live recommendation compared to its
+        own past occurrences, and a just-ended one still shows its last
+        result until the next occurrence starts."""
+        from event_price_engine import bazaar_bridge as _bridge
+
+        pipeline_obj = self._get_event_pipeline()
+        as_of_ts = int(time.time())
+        event_types = sorted(_bridge.TRACKED_FESTIVAL_KEYS | {"jerry_workshop"})
+        # Also include oringo/harvest_festival/year_of_pig even if
+        # not in TRACKED_FESTIVAL_KEYS (they are, but belt-and-suspenders)
+        event_types = sorted(set(event_types) | {"harvest_festival", "oringo", "year_of_pig"})
+
+        sections = []
+        for event_type in event_types:
+            all_instances = pipeline_obj.db.load_event_instances(event_type)
+            if not all_instances:
+                continue  # never actually occurred yet - nothing to show
+
+            current_instance = all_instances[-1]
+            historical_count = max(0, len(all_instances) - 1)
+
+            item_ids = pipeline_obj.db.load_items_for_event_type(event_type)
+            item_rows = []
+            for item_id in item_ids:
+                try:
+                    rec = pipeline_obj.generate_recommendation(item_id, current_instance, as_of_ts)
+                except Exception:
+                    rec = None
+                if rec is not None:
+                    item_rows.append({"item_id": item_id, "recommendation": rec})
+
+            sections.append({
+                "event_type": event_type,
+                "current_instance": current_instance,
+                "historical_count": historical_count,
+                "items": item_rows,
+            })
+        return sections
+
     def open_manage_categories(self):
         counts = {}
         for f in self.all_flips:
@@ -2351,6 +3133,86 @@ class BazaarFlipperApp(tk.Tk):
         save_json(BLACKLIST_PATH, sorted(self.blacklist))
         self.recompute_and_render()
 
+    # -- storage ----------------------------------------------------------
+    # Stored entirely under APP_DATA_DIR (see STORAGE_PATH above), the same
+    # per-user folder every other *_PATH file already lives in - so it
+    # persists across both ordinary app restarts AND the built-in
+    # self-updater (_apply_update/robocopy only ever mirrors files into
+    # the install folder next to the .exe, never into APP_DATA_DIR).
+    def _next_storage_entry_id(self):
+        """A collision-safe id for a new storage entry - millisecond
+        timestamp plus the current list length as a tiebreaker, so two
+        entries added within the same millisecond (e.g. rapid clicking)
+        still get distinct ids."""
+        return f"{int(time.time() * 1000)}_{len(self.storage)}"
+
+    def save_storage(self):
+        save_json(STORAGE_PATH, self.storage)
+
+    def add_flip_to_storage(self, flip):
+        """Snapshots the CURRENT numbers off a live flip card into a
+        standalone Storage entry. This is a copy, not a live link - the
+        bazaar keeps moving, so what you saved is what you saw at the
+        moment you clicked "Add to Storage," not an auto-updating quote."""
+        entry = {
+            "entry_id": self._next_storage_entry_id(),
+            "source": "flip",
+            "product_id": flip.get("id"),
+            "item": flip.get("item"),
+            "category": flip.get("category"),
+            "buy_at": flip.get("buy_order_at"),
+            "sell_at": flip.get("sell_offer_at"),
+            "profit": flip.get("profit"),
+            "margin": flip.get("margin"),
+            "quantity": 1,
+            "notes": "",
+            "added_ts": time.time(),
+        }
+        self.storage.append(entry)
+        self.save_storage()
+        if self.view_mode == "storage":
+            self.recompute_and_render()
+
+    def add_manual_storage_entry(self, data):
+        """Adds a hand-typed Storage entry (see ManualStorageDialog).
+        Profit/margin are only computed when both a buy and sell price
+        were given - otherwise this is stored as a plain note."""
+        buy_at = data.get("buy_at")
+        sell_at = data.get("sell_at")
+        profit = None
+        margin = None
+        if buy_at is not None and sell_at is not None and buy_at > 0:
+            post_tax = sell_at * (1 - BAZAAR_TAX)
+            profit = round(post_tax - buy_at, 1)
+            margin = round((profit / buy_at) * 100, 1)
+
+        entry = {
+            "entry_id": self._next_storage_entry_id(),
+            "source": "manual",
+            "product_id": None,
+            "item": data.get("item", "Unknown Item"),
+            "category": data.get("category") or "Manual",
+            "buy_at": buy_at,
+            "sell_at": sell_at,
+            "profit": profit,
+            "margin": margin,
+            "quantity": data.get("quantity", 1),
+            "notes": data.get("notes", ""),
+            "added_ts": time.time(),
+        }
+        self.storage.append(entry)
+        self.save_storage()
+        if self.view_mode == "storage":
+            self.recompute_and_render()
+
+    def remove_from_storage(self, entry_id):
+        self.storage = [e for e in self.storage if e.get("entry_id") != entry_id]
+        self.save_storage()
+        self.recompute_and_render()
+
+    def open_manual_storage_dialog(self):
+        ManualStorageDialog(self, self.get_all_categories(), self.add_manual_storage_entry)
+
     # -- seasonal events / mayor -----------------------------------------
     def _recompute_active_event_keys(self):
         """Rebuilds the set of event_keys that are ACTUALLY live right now
@@ -2361,6 +3223,12 @@ class BazaarFlipperApp(tk.Tk):
         keys = {f["event_key"] for f in self.active_festivals if f["active_now"]}
         if self.jerry_status.get("active"):
             keys.add("jerry_workshop")
+        if getattr(self, "harvest_status", {}).get("active"):
+            keys.add("harvest_festival")
+        if getattr(self, "oringo_status_info", {}).get("active"):
+            keys.add("oringo")
+        if getattr(self, "year_of_pig_status_info", {}).get("active"):
+            keys.add("year_of_pig")
         self.active_event_keys = keys
 
     def _market_context(self):
@@ -2382,6 +3250,13 @@ class BazaarFlipperApp(tk.Tk):
             live_labels.append("Jerry's Workshop")
         if self.paul_discount_active:
             live_labels.append("Paul \u201320% Chests")
+        if getattr(self, "harvest_status", {}).get("active"):
+            live_labels.append("Harvest Festival")
+        if getattr(self, "oringo_status_info", {}).get("active"):
+            pet = self.oringo_status_info.get("current_pet", "?")
+            live_labels.append(f"Traveling Zoo ({pet})")
+        if getattr(self, "year_of_pig_status_info", {}).get("active"):
+            live_labels.append("Year of the Pig")
         if live_labels:
             parts.append("Active: " + ", ".join(live_labels))
         return "  \u00b7  ".join(parts)
@@ -2417,34 +3292,71 @@ class BazaarFlipperApp(tk.Tk):
             pass
 
         self.after(0, self._on_fetch_success, category_map, flips, snapshot_ms, mayor_info)
-
     def _on_fetch_success(self, category_map, flips, snapshot_ms, mayor_info=None):
         self.category_map = category_map
         self.all_flips = flips
+        self._data_ready = True
         self.status_var.set("Bazaar data loaded successfully")
         self.refresh_btn.state(["!disabled"])
-
-        if mayor_info:
-            self.mayor_info = mayor_info
-        self.active_festivals = compute_active_festivals(self.mayor_info)
-        self.paul_discount_active = paul_dungeon_discount_active(self.mayor_info)
-        self.jerry_status = jerry_workshop_status()
-        self._recompute_active_event_keys()
-        self.events_var.set(self._events_status_text())
 
         # snapshot_ms is Hypixel's OWN capture time for this data (ms since
         # epoch), not our fetch time - the two can differ if their backend
         # served a cached response. snapshot_local_ref is our local clock
         # at the moment we received it, so the ticking "Xs old" label below
-        # stays accurate between refreshes without re-hitting the API.
+        # stays accurate between refreshes without re-hitting the API. This
+        # only needs snapshot_ms (already in hand above), so it's pulled up
+        # here rather than sitting after the enrichment block below.
         self.last_snapshot_ms = snapshot_ms
         self.last_snapshot_local_ref = time.time()
         self._tick_snapshot_age()
 
-        self._rebuild_category_bar()
-        self._rebuild_event_filter_options()
+        # Everything below is enrichment on top of the flip data already
+        # stored above - mayor/festival context, the event_price_engine
+        # bridge, category/event-filter rebuilds. This used to run
+        # unguarded, so an exception anywhere in here (e.g. bridge_tick
+        # hitting the event_price_engine DB) aborted the rest of this
+        # method BEFORE reaching the after_idle(recompute_and_render) call
+        # at the bottom. Tk swallows exceptions raised inside an after()
+        # callback silently (just prints to stderr, no dialog), so the
+        # Overnight Plan was left sitting on "Loading live bazaar data..."
+        # forever with no visible error - only "fixed" by switching to
+        # another view and back, since that calls recompute_and_render
+        # directly via set_view() and never goes through this method at
+        # all. Wrapping it means a failure here can no longer swallow the
+        # render that's supposed to happen on every refresh.
+        try:
+            if mayor_info:
+                self.mayor_info = mayor_info
+            self.active_festivals = compute_active_festivals(self.mayor_info)
+            self.paul_discount_active = paul_dungeon_discount_active(self.mayor_info)
+            self.jerry_status = jerry_workshop_status()
+            self.harvest_status = harvest_festival_status(mayor_info=self.mayor_info)
+            self.oringo_status_info = oringo_status()
+            self.year_of_pig_status_info = year_of_pig_status()
+            self._recompute_active_event_keys()
+            self.events_var.set(self._events_status_text())
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            from event_price_engine import bazaar_bridge
+            bazaar_bridge.bridge_tick(self)
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            self._rebuild_category_bar()
+            self._rebuild_event_filter_options()
+        except Exception:
+            traceback.print_exc()
+
         self._full_list_shown = self._full_list_page_size
-        self.recompute_and_render()
+        # Let Tk finish laying out the initial view before drawing cards.
+        # This prevents the first Overnight Plan render from racing the
+        # asynchronous fetch/layout sequence on startup. Runs
+        # unconditionally (outside the try above) so it can never again be
+        # silently skipped.
+        self.after_idle(self.recompute_and_render)
 
     def _tick_snapshot_age(self):
         """Keeps the 'Hypixel snapshot: Xs old' label live between fetches,
@@ -2539,25 +3451,44 @@ class BazaarFlipperApp(tk.Tk):
         self.recompute_and_render()
 
     def recompute_and_render(self):
-        if not self.all_flips:
+        if not self._data_ready:
+            self._render_loading_state()
+            return
+        if self.view_mode == "event_engine":
+            self._render_event_engine()
+            return
+        if self.view_mode == "storage":
+            self._render_storage()
             return
         purse = self._get_purse()
         buffer_pct = self._get_buy_buffer_pct()
         buffered = apply_buy_buffer(self._filtered_flips(), buffer_pct)
         flips = compute_purse_metrics(buffered, purse)
-        self._render_cards(flips, purse)
+        if self.view_mode == "dashboard":
+            self._render_overnight_plan(flips, purse)
+        else:
+            self._render_full_list(flips, purse)
 
     # -- sorting (Full List only) --------------------------------------------
     def _on_sort_change(self):
         label = self.sort_var.get()
-        key = next((k for l, k in SORT_OPTIONS if l == label), "profit_hr")
-        self.sort_key = key
+        options = EVENT_ENGINE_SORT_OPTIONS if self.view_mode == "event_engine" else SORT_OPTIONS
+        key = next((k for l, k in options if l == label), options[0][1])
+        if self.view_mode == "event_engine":
+            self.event_sort_key = key
+        else:
+            self.sort_key = key
         self._full_list_shown = self._full_list_page_size
         self.recompute_and_render()
 
     def _toggle_sort_dir(self):
-        self.sort_reverse = not self.sort_reverse
-        self.sort_dir_btn.configure(text="\u25bc Desc" if self.sort_reverse else "\u25b2 Asc")
+        if self.view_mode == "event_engine":
+            self.event_sort_reverse = not self.event_sort_reverse
+            reverse = self.event_sort_reverse
+        else:
+            self.sort_reverse = not self.sort_reverse
+            reverse = self.sort_reverse
+        self.sort_dir_btn.configure(text="\u25bc Desc" if reverse else "\u25b2 Asc")
         self._full_list_shown = self._full_list_page_size
         self.recompute_and_render()
 
@@ -2566,9 +3497,152 @@ class BazaarFlipperApp(tk.Tk):
         self.recompute_and_render()
 
     # -- rendering ----------------------------------------------------------
-    def _render_cards(self, flips, purse):
+    def _clear_cards(self):
         for child in self.cards_scroll.inner.winfo_children():
             child.destroy()
+
+    def _render_loading_state(self):
+        """Render a real initial state instead of leaving an empty list while
+        the first background market request is still in flight."""
+        if not hasattr(self, "cards_scroll"):
+            return
+        self._clear_cards()
+        self.card_title.configure(text="Overnight Plan")
+        self.card_body.configure(text="Loading live bazaar data. Your first plan will appear automatically.")
+        self.count_var.set("")
+
+    def _render_storage(self):
+        """Renders the Storage tab: everything saved via "Add to Storage"
+        on a flip card, plus every manually-typed entry, newest first.
+        Search (from the shared filter row, when visible) matches on item
+        name/category/notes."""
+        self._clear_cards()
+        self.card_title.configure(text=f"Storage \u2014 {len(self.storage)} item(s)")
+        self.card_body.configure(
+            text="Items you've pinned for later, either saved straight off a flip card or typed in "
+                 "by hand. These are a snapshot of the numbers at the time they were added, not a "
+                 "live quote - refresh the Full List and re-add if you want the current price. "
+                 "Saved to your local user data folder, so this list survives app restarts and "
+                 "updates.")
+
+        query = self.search_var.get().strip().lower()
+        entries = list(self.storage)
+        if query:
+            entries = [e for e in entries
+                       if query in (e.get("item") or "").lower()
+                       or query in (e.get("category") or "").lower()
+                       or query in (e.get("notes") or "").lower()]
+        entries.sort(key=lambda e: e.get("added_ts", 0), reverse=True)
+
+        if not entries:
+            empty_text = ("Nothing in Storage yet. Tap \"Add to Storage\" on any item in the "
+                           "Overnight Plan or Full List, or use \"+ Add to Storage\" up top for a "
+                           "manual entry." if not self.storage else
+                           "No storage items match your search.")
+            tk.Label(self.cards_scroll.inner, text=empty_text, font=FONT_MAIN, bg=BG_DARK,
+                     fg=TEXT_DIM, wraplength=1000, justify="left").pack(anchor="w", padx=4, pady=12)
+        else:
+            for entry in entries:
+                card = StorageCard(self.cards_scroll.inner, entry, self.remove_from_storage)
+                card.pack(fill="x", pady=1)
+
+        self.count_var.set(f"Showing {len(entries)} of {len(self.storage)} storage item(s)")
+
+    def _render_event_engine(self):
+        """Render the event engine inside the shared content frame.
+
+        The engine remains the single source of recommendation/scoring data;
+        this view only filters, sorts, and presents those recommendations.
+        """
+        self._clear_cards()
+        self.card_title.configure(text="Event Engine")
+        self.card_body.configure(
+            text="Event-driven Buy / Hold / Sell signals built from recorded seasonal occurrences. "
+                 "Confidence is green at 75%+, amber at 50–74%, and red below 50%. "
+                 "Use search, event type, and sorting to focus the list.")
+        try:
+            sections = self._gather_event_sections()
+        except Exception as exc:
+            self.count_var.set("Event analysis unavailable")
+            tk.Label(self.cards_scroll.inner, text=f"Couldn't load event analysis: {exc}",
+                     font=FONT_MAIN, bg=BG_DARK, fg=ACCENT_RED).pack(anchor="w", padx=4, pady=12)
+            return
+
+        selected_label = self.event_filter_var.get()
+        selected_key = self._event_filter_label_to_key.get(selected_label)
+        query = self.search_var.get().strip().lower()
+        if selected_key:
+            sections = [s for s in sections if s["event_type"] == selected_key]
+
+        shown = 0
+        for section in sections:
+            rows = [row for row in section["items"] if not query or query in row["item_id"].lower()]
+            if not rows:
+                continue
+            rows.sort(key=self._event_row_sort_value, reverse=self.event_sort_reverse)
+            self._render_event_section(section, rows)
+            shown += len(rows)
+
+        if not shown:
+            tk.Label(self.cards_scroll.inner,
+                     text="No event recommendations match the current search or filter. "
+                          "Historical signals appear after an event has recorded enough price data.",
+                     font=FONT_MAIN, bg=BG_DARK, fg=TEXT_DIM, wraplength=1000,
+                     justify="left").pack(anchor="w", padx=4, pady=12)
+        self.count_var.set(f"Showing {shown} event recommendation(s)")
+
+    def _event_row_sort_value(self, row):
+        rec = row["recommendation"]
+        if self.event_sort_key == "item":
+            return row["item_id"].lower()
+        if self.event_sort_key == "action":
+            return rec.action if rec else "hold"
+        if self.event_sort_key == "movement":
+            return rec.expected_appreciation if rec else 0.0
+        if rec is None:
+            return 0.0
+        return max(rec.buy_confidence, rec.sell_confidence)
+
+    def _render_event_section(self, section, rows):
+        event_type = section["event_type"]
+        label, color = EVENT_BADGE_STYLE.get(event_type, (event_type, ACCENT))
+        current = section["current_instance"]
+        started = time.strftime("%Y-%m-%d %H:%M", time.localtime(current.start_ts))
+        state = "ongoing" if not current.end_ts else "ended"
+
+        wrap = tk.Frame(self.cards_scroll.inner, bg=BG_DARK)
+        wrap.pack(fill="x", pady=(4, 12))
+        heading = tk.Frame(wrap, bg=BG_PANEL)
+        heading.pack(fill="x")
+        tk.Frame(heading, bg=color, width=4).pack(side="left", fill="y")
+        tk.Label(heading, text=label, font=FONT_SUBHEAD, bg=BG_PANEL, fg=color).pack(side="left", padx=(10, 6), pady=9)
+        tk.Label(heading, text=f"Started {started} · {state}", font=FONT_MAIN,
+                 bg=BG_PANEL, fg=TEXT_DIM).pack(side="left", pady=9)
+        tk.Label(heading, text=f"{section['historical_count']} prior occurrence(s)", font=FONT_MAIN,
+                 bg=BG_PANEL, fg=TEXT_FAINT).pack(side="right", padx=10, pady=9)
+        # Show current Oringo pet for oringo sections
+        if event_type == "oringo":
+            oringo_info = getattr(self, "oringo_status_info", {})
+            pet_name = oringo_info.get("current_pet", "Unknown")
+            override = self.settings.get("oringo_pet_override", "Auto")
+            if override != "Auto":
+                pet_name = f"{override} (manual override)"
+            pet_lbl = tk.Label(wrap, text=f"    Current legendary pet: {pet_name}",
+                               font=FONT_MAIN, bg=BG_DARK, fg=ACCENT_YELLOW)
+            pet_lbl.pack(anchor="w", pady=(2, 4))
+        for row in rows:
+            EventItemCard(wrap, row["item_id"], row["recommendation"]).pack(fill="x", pady=(1, 0))
+
+    def _render_overnight_plan(self, flips, purse):
+        """Render the Overnight Plan view in the shared scroll frame."""
+        self._render_cards(flips, purse)
+
+    def _render_full_list(self, flips, purse):
+        """Render the Full List view in the shared scroll frame."""
+        self._render_cards(flips, purse)
+
+    def _render_cards(self, flips, purse):
+        self._clear_cards()
 
         if self.view_mode == "dashboard":
             sleep_hours = self._get_sleep_hours()
@@ -2633,7 +3707,7 @@ class BazaarFlipperApp(tk.Tk):
         for f in visible_rows:
             card = FlipCard(self.cards_scroll.inner, f, mode, self.open_category_dialog,
                              sleep_hours=sleep_hours, on_blacklist=self.blacklist_item,
-                             market_context=market_context)
+                             market_context=market_context, on_add_storage=self.add_flip_to_storage)
             card.pack(fill="x", pady=1)
 
         if self.view_mode == "full" and more_remaining > 0:
@@ -2653,6 +3727,8 @@ class BazaarFlipperApp(tk.Tk):
     def on_close(self):
         if self._auto_refresh_after_id is not None:
             self.after_cancel(self._auto_refresh_after_id)
+        if self._event_pipeline is not None:
+            self._event_pipeline.close()
         self.settings.update({
             "purse": self.purse_var.get(),
             "sleep_hours": self.sleep_hours_var.get(),
