@@ -59,7 +59,7 @@ MIN_AUTO_REFRESH_MINUTES = 1  # floor - avoids hammering Hypixel's API if
 # downloadable asset - a bare tag or commit wouldn't give the user
 # anything to click through to.
 #
-APP_VERSION = "1.1.5"  # bump this string with each GitHub release you publish
+APP_VERSION = "1.1.6"  # bump this string with each GitHub release you publish
 GITHUB_REPO = "Lexiixell/Bazaarflipper"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -3389,7 +3389,7 @@ class BazaarFlipperApp(tk.Tk):
 
     def _get_event_pipeline(self):
         """Lazily builds (and caches) a Pipeline facade from event_price_engine,
-        pointed at the exact same sqlite DB bazaar_bridge.bridge_tick() has
+        pointed at the exact same DuckDB store bazaar_bridge.bridge_tick() has
         already been writing to every refresh (self._event_price_db, set
         there in _on_fetch_success) - reusing that already-resolved path
         instead of re-deriving it, so this can never end up pointed at a
