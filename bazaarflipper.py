@@ -2500,6 +2500,70 @@ class StorageCard(tk.Frame):
             self.arrow_lbl.configure(text="\u25b6")
 
 
+# -- live (heuristic) buy/sell read for event items with no scored history --
+LIVE_VERDICT_MIN_SAMPLES = 5      # need at least this many in-event samples
+LIVE_VERDICT_MIN_RANGE_PCT = 1.0  # event range must span >= this % of baseline
+LIVE_SELL_POS = 0.70              # instabuy in top 30% of event range -> sell
+LIVE_BUY_POS = 0.30               # buy order in bottom 30% of range -> buy
+LIVE_SELL_MIN_UP_PCT = 2.0        # ...and instabuy at least this far over pre-event
+LIVE_BUY_MAX_UP_PCT = 1.0         # ...and entry not already run up past pre-event
+
+
+def live_event_verdict(live):
+    """Heuristic good-time-to-buy/sell read for a live-tracked event item,
+    from this occurrence's own recorded range only (no historical scoring -
+    that's the engine's job once a past occurrence exists). Flip model: you
+    ENTER by placing a buy order (raw_buy_target side) and EXIT by selling
+    at instabuy (raw_sell_target side), so each call reads its own side:
+    sell when instabuy is near this event's high and above pre-event, buy
+    when the buy-order side is near this event's low and hasn't run up.
+    When only instabuy data exists (engine-DB fallback rows), it stands in
+    for both sides. Returns {"action": "buy"|"sell"|"hold", "reason": str}."""
+    sell = live
+    buy = live.get("buy_order") or live
+
+    def pos_in_range(side):
+        span = side["high"] - side["low"]
+        if span <= 0:
+            return None
+        return (side["current"] - side["low"]) / span
+
+    if sell["n_samples"] < LIVE_VERDICT_MIN_SAMPLES:
+        return {"action": "hold",
+                "reason": (f"only {sell['n_samples']} sample(s) recorded this event so far - "
+                           "too few to call a buy/sell window yet")}
+
+    range_pct = ((sell["high"] - sell["low"]) / sell["baseline"] * 100.0
+                 if sell["baseline"] > 0 else 0.0)
+    if range_pct < LIVE_VERDICT_MIN_RANGE_PCT:
+        return {"action": "hold",
+                "reason": (f"price has stayed within {range_pct:.1f}% of its pre-event level "
+                           "this event - too flat for a timing call")}
+
+    sell_pos = pos_in_range(sell)
+    buy_pos = pos_in_range(buy)
+
+    if (sell_pos is not None and sell_pos >= LIVE_SELL_POS
+            and sell["pct_change"] >= LIVE_SELL_MIN_UP_PCT):
+        return {"action": "sell",
+                "reason": (f"instabuy (your sell fill) is in the top {(1 - sell_pos) * 100:.0f}% "
+                           f"of this event's range and {sell['pct_change']:+.1f}% over its "
+                           "pre-event price - selling into this strength looks good")}
+    if (buy_pos is not None and buy_pos <= LIVE_BUY_POS
+            and buy["pct_change"] <= LIVE_BUY_MAX_UP_PCT):
+        return {"action": "buy",
+                "reason": (f"buy order (your entry) is in the bottom {buy_pos * 100:.0f}% of "
+                           f"this event's range and {buy['pct_change']:+.1f}% vs pre-event - "
+                           "entering here looks cheap")}
+
+    def _pos_str(p):
+        return f"{p * 100:.0f}% up" if p is not None else "flat within"
+    return {"action": "hold",
+            "reason": (f"no strong edge right now - instabuy sits {_pos_str(sell_pos)} its event "
+                       f"range ({sell['pct_change']:+.1f}% vs pre-event), buy order "
+                       f"{_pos_str(buy_pos)} its range ({buy['pct_change']:+.1f}%)")}
+
+
 class EventItemCard(tk.Frame):
     """One item's event-driven Buy/Hold/Sell analysis, collapsible like
     FlipCard. Displays exactly what the event_price_engine's Recommendation
@@ -2521,13 +2585,13 @@ class EventItemCard(tk.Frame):
         inner = tk.Frame(self, bg=BG_PANEL)
         inner.pack(fill="both", expand=True)
 
-        action = recommendation.action if recommendation else "hold"
+        self.live_verdict = None
+        if recommendation is None and live is not None:
+            self.live_verdict = live_event_verdict(live)
+        action = (recommendation.action if recommendation else
+                  self.live_verdict["action"] if self.live_verdict else "hold")
         action_color = {"buy": ACCENT_GREEN, "sell": ACCENT_RED,
                         "hold": ACCENT_YELLOW}.get(action, TEXT_DIM)
-        if recommendation is None and live is not None:
-            pct = live["pct_change"]
-            action_color = (ACCENT_GREEN if pct >= 1.0 else
-                            ACCENT_RED if pct <= -1.0 else ACCENT_YELLOW)
 
         stripe = tk.Frame(inner, bg=action_color, width=4)
         stripe.pack(side="left", fill="y")
@@ -2542,7 +2606,7 @@ class EventItemCard(tk.Frame):
         name_lbl = tk.Label(header, text=name_text, font=FONT_SUBHEAD, bg=BG_PANEL, fg=TEXT_MAIN)
         name_lbl.pack(side="left", padx=(10, 8), pady=6)
 
-        pill_text = action.upper() if recommendation else ("LIVE" if live else action.upper())
+        pill_text = f"LIVE {action.upper()}" if (recommendation is None and live) else action.upper()
         action_lbl = tk.Label(header, text=pill_text, font=FONT_PILL, bg=BG_PANEL, fg=action_color)
         action_lbl.pack(side="left", pady=6)
 
@@ -2636,38 +2700,23 @@ class EventItemCard(tk.Frame):
                 tk.Label(cell, text=" " + text, font=FONT_BOLD, bg=BG_PANEL_RAISED,
                          fg=TEXT_MAIN).pack(side="left")
 
-            # An honest "where does the price stand" read for this event so
-            # far - NOT a scored good/bad-time-to-sell call (that needs a
-            # past occurrence), just where the current instabuy sits inside
-            # the range this event has actually traded.
-            span = lv["high"] - lv["low"]
-            if span > 0:
-                pos = (lv["current"] - lv["low"]) / span
-                if pos >= 0.75:
-                    where = (f"near the TOP of this event's range so far "
-                             f"(top {max(0.0, (1 - pos) * 100):.0f}%)")
-                    where_color = ACCENT_GREEN if lv["pct_change"] >= 0 else ACCENT_YELLOW
-                elif pos <= 0.25:
-                    where = (f"near the BOTTOM of this event's range so far "
-                             f"(bottom {max(0.0, pos * 100):.0f}%)")
-                    where_color = ACCENT_RED if lv["pct_change"] <= 0 else ACCENT_YELLOW
-                else:
-                    where = "mid-range for this event so far"
-                    where_color = ACCENT_YELLOW
+            if self.live_verdict is not None:
+                v = self.live_verdict
+                v_color = {"buy": ACCENT_GREEN, "sell": ACCENT_RED}.get(v["action"], ACCENT_YELLOW)
                 tk.Label(self.detail,
-                         text=(f"Right now: instabuy is {where}, {lv['pct_change']:+.1f}% vs "
-                               f"its pre-event price."),
-                         font=FONT_MAIN, bg=BG_PANEL_RAISED, fg=where_color,
+                         text=f"Live read: {v['action'].upper()} - {v['reason']}.",
+                         font=FONT_BOLD, bg=BG_PANEL_RAISED, fg=v_color,
                          wraplength=880, justify="left").pack(anchor="w", padx=16, pady=(4, 0))
 
         if rec is None:
             if self.live is not None:
-                note = ("Live tracking only for now - a scored good/bad-time-to-buy/sell call "
-                        "needs at least one closed past occurrence of this event to compare "
-                        "against. The numbers above show how this item has actually moved since "
-                        "the current occurrence started; once this occurrence ends, the next one "
-                        "gets the full verdict automatically (Buy/Hold/Sell, confidence, and the "
-                        "historically best buy and sell windows around the event).")
+                note = ("The LIVE read above is a range-based heuristic from this occurrence "
+                        "only: buy when your entry (buy order) sits near this event's low, sell "
+                        "when your exit (instabuy) sits near its high and above the pre-event "
+                        "price. A fully scored call - confidence, expected move, and the "
+                        "historically best buy/sell windows - needs at least one closed past "
+                        "occurrence, and fills in automatically starting with this event's next "
+                        "occurrence.")
             else:
                 note = ("No current Buy/Hold/Sell recommendation yet - this needs at least one "
                         "closed historical occurrence of this event (with price history recorded "
@@ -4377,7 +4426,10 @@ class BazaarFlipperApp(tk.Tk):
         if self.event_sort_key == "item":
             return row["item_id"].lower()
         if self.event_sort_key == "action":
-            return rec.action if rec else "hold"
+            if rec:
+                return rec.action
+            live = row.get("live")
+            return live_event_verdict(live)["action"] if live else "hold"
         if self.event_sort_key == "movement":
             if rec:
                 return rec.expected_appreciation
