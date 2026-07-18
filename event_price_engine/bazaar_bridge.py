@@ -62,6 +62,12 @@ class BridgeState:
         # whole process (cached on app._event_price_bridge_state), so this
         # only runs once per boot, exactly matching "when it was booted."
         self.session_id = db.resume_or_start_session(int(time.time()))
+        # First tick of each run does a one-time JSON catch-up sweep
+        # (recovering anything a previous run recorded but never ingested,
+        # e.g. crash between the app's JSON save and the bridge's ingest);
+        # every tick after that feeds the store straight from memory --
+        # see the ingest branch in bridge_tick.
+        self.json_catchup_done = False
 
     def _load_open_instances(self) -> dict:
         rows = self.db.conn.execute(
@@ -211,7 +217,24 @@ def bridge_tick(app, db_dir: Optional[str] = None):
                                 forecast_events, DEFAULT_EVENT_LEAD_HOURS)
     _sync_item_event_map(db, app.all_flips, tag_event_relevance)
 
-    inserted = db.import_price_history_json(PRICE_HISTORY_PATH)
+    # Price ingest. First tick of the run: sweep price_history.json once
+    # to catch up on anything recorded but not ingested last run. Every
+    # tick after: feed this tick's samples straight from the flips already
+    # in memory -- same [ts, buy_target, sell_target] shape the app writes
+    # to the JSON, but without re-parsing a ~28MB file on the Tk main
+    # thread just to rediscover ~1 new sample per item (that re-parse cost
+    # ~0.4s/tick and grew with the file). The JSON keeps being written by
+    # the fetch worker regardless, so it stays a complete 7-day record for
+    # the app's own manipulation check and for the next boot's catch-up.
+    if not state.json_catchup_done:
+        inserted = db.import_price_history_json(PRICE_HISTORY_PATH)
+        state.json_catchup_done = True
+    else:
+        tick_samples = {
+            f["id"]: [[now_ts, f["raw_buy_target"], f["raw_sell_target"]]]
+            for f in app.all_flips
+        }
+        inserted = db.ingest_price_samples(tick_samples)
 
     # Forecast the next start of each cleanly-forecastable event and record it,
     # so the engine can flag "~24h away" and pre-position related items. Uses

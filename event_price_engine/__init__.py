@@ -38,6 +38,9 @@ class Database:
     def import_price_history_json(self, json_path: str) -> int:
         return _db.import_price_history_json(self.conn, json_path)
 
+    def ingest_price_samples(self, samples_by_item: dict) -> int:
+        return _db.ingest_price_samples(self.conn, samples_by_item)
+
     def export_price_history_gz(self, out_path: str, item_id: Optional[str] = None):
         _db.export_price_history_gz(self.conn, out_path, item_id)
 
